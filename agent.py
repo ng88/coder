@@ -1430,9 +1430,10 @@ class RemoteAgent:
         self.operation_lock = asyncio.Lock()
 
     def print_identity(self, *, replaced: bool = False) -> None:
-        label = "New machine token" if replaced else "Machine token"
-        print(colorize(label + ":", ANSI_BOLD, ANSI_CYAN), flush=True)
-        print(colorize(self.identity.token, ANSI_CYAN), flush=True)
+        print()
+        print(" ", colorize("My token is:", ANSI_BOLD, ANSI_CYAN), flush=True)
+        print(" ", colorize(self.identity.token, ANSI_CYAN), flush=True)
+        print()
         if self.copy_token:
             self.copy_identity_token()
 
@@ -1442,7 +1443,7 @@ class RemoteAgent:
             return
         encoded = base64.b64encode(self.identity.token.encode("utf-8")).decode("ascii")
         print(f"\033]52;c;{encoded}\a", end="", flush=True)
-        print(colorize("Token copy requested via terminal clipboard (OSC 52).", ANSI_GREEN), flush=True)
+        print(colorize("Token copied.", ANSI_GREEN), flush=True)
 
     async def copy_key_loop(self) -> None:
         if os.name != "posix" or not sys.stdin.isatty() or not sys.stdout.isatty():
