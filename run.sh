@@ -1477,7 +1477,8 @@ class RemoteAgent:
         if not sys.stdout.isatty():
             print("Token copy skipped: stdout is not a terminal.", file=sys.stderr, flush=True)
             return
-        encoded = base64.b64encode(self.identity.token.encode("utf-8")).decode("ascii")
+        clipboard_text = f"My token is {self.identity.token}"
+        encoded = base64.b64encode(clipboard_text.encode("utf-8")).decode("ascii")
         print(f"\033]52;c;{encoded}\a", end="", flush=True)
         print(colorize("Token copied.", ANSI_GREEN), flush=True)
 
