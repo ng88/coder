@@ -11,15 +11,20 @@ outbound to a WebSocket server, prints a temporary token of the form
 - apply_patch
 - list_files
 
-By default, shell commands run inside a Bubblewrap sandbox with the project
-mounted read/write at /workspace, useful system directories mounted read-only,
-a temporary HOME/tmp, an isolated PID namespace, and no network access.
+By default, shell commands run inside an OS sandbox. Linux uses Bubblewrap with
+the project mounted read/write at /workspace, useful system directories mounted
+read-only, a temporary HOME/tmp, an isolated PID namespace, and no network
+access. macOS uses the native sandbox-exec facility to restrict writes to the
+project and temporary directory and to deny network access by default.
 
 Python dependency:
     pip install websockets
 
 Linux dependency for sandboxed command execution:
     bubblewrap (bwrap)
+
+macOS dependency for sandboxed command execution:
+    sandbox-exec (included with supported macOS versions)
 """
 
 from __future__ import annotations
@@ -700,8 +705,12 @@ class AgentTools:
         cwd_host = self.workspace.resolve_existing(cwd_value or ".", want_dir=True)
         cwd_sandbox = self.workspace.to_sandbox_path(cwd_host)
         if self.sandbox:
-            argv = self._build_bwrap_command(command, cwd_sandbox)
-            proc_cwd = str(self.workspace.root)
+            if sys.platform == "darwin":
+                argv = self._build_macos_sandbox_command(command)
+                proc_cwd = str(cwd_host)
+            else:
+                argv = self._build_bwrap_command(command, cwd_sandbox)
+                proc_cwd = str(self.workspace.root)
         else:
             argv = ["/bin/bash", "-lc", command]
             proc_cwd = str(cwd_host)
@@ -1086,9 +1095,12 @@ class AgentTools:
                     yield resolved
 
     def _minimal_env(self) -> dict[str, str]:
+        sandbox_home = "/tmp/home"
+        if sys.platform == "darwin":
+            sandbox_home = tempfile.gettempdir()
         env = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HOME": "/tmp/home" if self.sandbox else tempfile.gettempdir(),
+            "HOME": sandbox_home if self.sandbox else tempfile.gettempdir(),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", ""),
             "TERM": os.environ.get("TERM", "dumb"),
@@ -1147,6 +1159,24 @@ class AgentTools:
 
         argv.extend(["--chdir", cwd, "/bin/bash", "-lc", command])
         return argv
+
+    def _build_macos_sandbox_command(self, command: str) -> list[str]:
+        # sandbox-exec/Seatbelt profiles are not namespace sandboxes like
+        # Bubblewrap. Keep normal system reads/process execution available, but
+        # restrict writes to the exposed project and temporary directory and
+        # deny network access unless explicitly requested.
+        workspace = json.dumps(str(self.workspace.root))
+        tmp_dir = json.dumps(tempfile.gettempdir())
+        profile = [
+            "(version 1)",
+            "(allow default)",
+            "(deny file-write*)",
+            f"(allow file-write* (subpath {workspace}))",
+            f"(allow file-write* (subpath {tmp_dir}))",
+        ]
+        if not self.network:
+            profile.append("(deny network*)")
+        return ["sandbox-exec", "-p", "\n".join(profile), "/bin/bash", "-lc", command]
 
     async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
@@ -1548,12 +1578,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--network",
         action="store_true",
-        help="Allow network access inside the Bubblewrap command sandbox.",
+        help="Allow network access inside the command sandbox.",
     )
     parser.add_argument(
         "--no-sandbox",
         action="store_true",
-        help="Disable Bubblewrap command sandboxing (DANGEROUS).",
+        help="Disable command sandboxing (DANGEROUS).",
     )
     parser.add_argument(
         "--copy-token",
@@ -1566,19 +1596,32 @@ def parse_args() -> argparse.Namespace:
 def validate_startup(args: argparse.Namespace, workspace: Workspace) -> None:
     if os.name != "posix":
         if not args.no_sandbox:
-            raise SystemExit("This V1 sandbox implementation requires Linux/Unix and bubblewrap. Use --no-sandbox only if you accept unrestricted execution.")
+            raise SystemExit("Sandboxed command execution currently requires Linux or macOS. Use --no-sandbox only if you accept unrestricted execution.")
 
-    if not args.no_sandbox and shutil.which("bwrap") is None:
-        raise SystemExit(
-            "Sandbox unavailable: 'bwrap' was not found.\n"
-            "Install the bubblewrap package, or explicitly use --no-sandbox (unsafe)."
-        )
+    if not args.no_sandbox:
+        if sys.platform == "darwin":
+            if shutil.which("sandbox-exec") is None:
+                raise SystemExit(
+                    "Sandbox unavailable: 'sandbox-exec' was not found on this macOS system.\n"
+                    "Use --no-sandbox only if you accept unrestricted execution."
+                )
+        elif shutil.which("bwrap") is None:
+            raise SystemExit(
+                "Sandbox unavailable: 'bwrap' was not found.\n"
+                "Install the bubblewrap package, or explicitly use --no-sandbox (unsafe)."
+            )
 
     if args.network and args.no_sandbox:
         print("Note: --network has no effect when --no-sandbox is used.", file=sys.stderr)
 
     print(f"Project root: {workspace.root}")
-    print(f"Filesystem sandbox: {'disabled (UNSAFE)' if args.no_sandbox else 'enabled'}")
+    if args.no_sandbox:
+        sandbox_status = "disabled (UNSAFE)"
+    elif sys.platform == "darwin":
+        sandbox_status = "enabled (macOS sandbox-exec)"
+    else:
+        sandbox_status = "enabled (bubblewrap)"
+    print(f"Filesystem sandbox: {sandbox_status}")
     print(f"Network access: {'enabled' if args.network or args.no_sandbox else 'disabled'}")
 
     if args.no_sandbox:
