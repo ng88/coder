@@ -538,6 +538,34 @@ class OpenAPITests(unittest.TestCase):
             {"startCommand", "pollCommand", "cancelCommand", "listCommands"}.issubset(operation_ids)
         )
 
+    def test_long_command_openapi_describes_agent_usage(self):
+        schema = server.app.openapi()
+        paths = schema["paths"]
+
+        start = paths["/api/start-command"]["post"]
+        poll = paths["/api/poll-command"]["post"]
+        cancel = paths["/api/cancel-command"]["post"]
+        listing = paths["/api/list-commands"]["post"]
+
+        self.assertIn("executeCommand for short commands", start["description"])
+        self.assertIn("returned stdout_offset", poll["description"])
+        self.assertIn("process tree", cancel["description"])
+        self.assertIn("recover a job_id", listing["description"])
+
+        components = schema["components"]["schemas"]
+        poll_request = components["PollCommandRequest"]["properties"]
+        self.assertIn("Reuse the returned stdout_offset", poll_request["stdout_offset"]["description"])
+        self.assertIn("Reuse the returned stderr_offset", poll_request["stderr_offset"]["description"])
+        self.assertIn("long-poll", poll_request["wait_seconds"]["description"])
+
+        poll_result = components["PollCommandResult"]["properties"]
+        self.assertIn("next poll", poll_result["stdout_offset"]["description"])
+        self.assertIn("older buffered output", poll_result["truncated"]["description"])
+
+        summary = components["CommandJobSummary"]["properties"]
+        self.assertIn("running, exited, failed, or cancelled", summary["status"]["description"])
+        self.assertIn("null while running", summary["exit_code"]["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

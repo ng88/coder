@@ -129,19 +129,41 @@ class ExecuteCommandRequest(TokenRequest):
 
 
 class StartCommandRequest(TokenRequest):
-    command: str = Field(..., min_length=1, max_length=MAX_COMMAND_CHARS)
-    cwd: str | None = Field(default=None, max_length=MAX_PATH_CHARS)
+    command: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_COMMAND_CHARS,
+        description="Bash command to start in the background. Use this instead of executeCommand for long-running work.",
+    )
+    cwd: str | None = Field(
+        default=None,
+        max_length=MAX_PATH_CHARS,
+        description="Working directory relative to the project root. Defaults to the project root.",
+    )
 
 
 class PollCommandRequest(TokenRequest):
-    job_id: str = Field(..., min_length=1, max_length=200)
-    stdout_offset: int = Field(default=0, ge=0)
-    stderr_offset: int = Field(default=0, ge=0)
-    wait_seconds: int = Field(default=0, ge=0, le=30)
+    job_id: str = Field(..., min_length=1, max_length=200, description="Job ID returned by startCommand.")
+    stdout_offset: int = Field(
+        default=0,
+        ge=0,
+        description="Return stdout produced after this offset. Reuse the returned stdout_offset on the next poll.",
+    )
+    stderr_offset: int = Field(
+        default=0,
+        ge=0,
+        description="Return stderr produced after this offset. Reuse the returned stderr_offset on the next poll.",
+    )
+    wait_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=30,
+        description="Optional long-poll wait. 0 returns immediately; otherwise wait up to this many seconds for output or completion.",
+    )
 
 
 class CommandJobRequest(TokenRequest):
-    job_id: str = Field(..., min_length=1, max_length=200)
+    job_id: str = Field(..., min_length=1, max_length=200, description="Job ID returned by startCommand.")
 
 
 class ListCommandsRequest(TokenRequest):
@@ -228,31 +250,31 @@ class CommandResult(BaseModel):
 
 
 class CommandJobSummary(BaseModel):
-    job_id: str
-    command: str
-    cwd: str
-    status: str
-    exit_code: int | None
-    duration_ms: int
+    job_id: str = Field(description="Opaque job identifier used with pollCommand and cancelCommand.")
+    command: str = Field(description="Original Bash command.")
+    cwd: str = Field(description="Project-relative working directory used for the command.")
+    status: str = Field(description="Current job state: running, exited, failed, or cancelled.")
+    exit_code: int | None = Field(description="Process exit code when finished; null while running.")
+    duration_ms: int = Field(description="Elapsed runtime in milliseconds.")
 
 
 class StartCommandResult(BaseModel):
-    job_id: str
-    status: str
-    command: str
-    cwd: str
+    job_id: str = Field(description="Opaque job identifier to pass to pollCommand, cancelCommand, or listCommands.")
+    status: str = Field(description="Initial job state, normally running.")
+    command: str = Field(description="Original Bash command.")
+    cwd: str = Field(description="Project-relative working directory used for the command.")
 
 
 class PollCommandResult(CommandJobSummary):
-    stdout: str
-    stderr: str
-    stdout_offset: int
-    stderr_offset: int
-    truncated: bool
+    stdout: str = Field(description="New stdout available after the requested stdout_offset.")
+    stderr: str = Field(description="New stderr available after the requested stderr_offset.")
+    stdout_offset: int = Field(description="Offset to send on the next poll to avoid receiving the same stdout again.")
+    stderr_offset: int = Field(description="Offset to send on the next poll to avoid receiving the same stderr again.")
+    truncated: bool = Field(description="True when older buffered output was discarded and the requested offset could not be fully satisfied.")
 
 
 class ListCommandsResult(BaseModel):
-    jobs: list[CommandJobSummary]
+    jobs: list[CommandJobSummary] = Field(description="Recent jobs, including running jobs, ordered newest first.")
 
 
 class ReadFileResult(BaseModel):
@@ -686,6 +708,11 @@ async def execute_command(request: ExecuteCommandRequest) -> JSONResponse | dict
     "/api/start-command",
     operation_id="startCommand",
     summary="Start a long-running Bash command",
+    description=(
+        "Start a Bash command without waiting for it to finish and return a job_id. Use for long builds, tests, "
+        "servers, or other work that may outlive a normal tool call. Then call pollCommand with the returned "
+        "offsets; use executeCommand for short commands."
+    ),
     response_model=StartCommandResult,
     responses=ERROR_RESPONSES,
 )
@@ -697,6 +724,11 @@ async def start_command(request: StartCommandRequest) -> JSONResponse | dict[str
     "/api/poll-command",
     operation_id="pollCommand",
     summary="Poll a long-running command and read new output",
+    description=(
+        "Read only new stdout/stderr for a job and inspect its status. Pass back the returned stdout_offset and "
+        "stderr_offset on each call. wait_seconds enables long polling up to 30 seconds and returns earlier when "
+        "new output arrives or the job finishes."
+    ),
     response_model=PollCommandResult,
     responses=ERROR_RESPONSES,
 )
@@ -712,6 +744,10 @@ async def poll_command(request: PollCommandRequest) -> JSONResponse | dict[str, 
     "/api/cancel-command",
     operation_id="cancelCommand",
     summary="Cancel a long-running command",
+    description=(
+        "Terminate the process tree for a job started with startCommand. Safe to call for an already-finished job; "
+        "the current final status is returned."
+    ),
     response_model=CommandJobSummary,
     responses=ERROR_RESPONSES,
 )
@@ -723,6 +759,10 @@ async def cancel_command(request: CommandJobRequest) -> JSONResponse | dict[str,
     "/api/list-commands",
     operation_id="listCommands",
     summary="List recent and running command jobs",
+    description=(
+        "List known command jobs, newest first. Use this to recover a job_id, inspect active work, or check recent "
+        "completion state. Output itself is retrieved with pollCommand."
+    ),
     response_model=ListCommandsResult,
     responses=ERROR_RESPONSES,
 )
