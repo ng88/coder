@@ -165,6 +165,198 @@ class PatchTests(unittest.TestCase):
         self.assertEqual((self.root / "edit.txt").read_text(), "alpha\nBETA\ngamma\n")
         self.assertFalse((self.root / "old.txt").exists())
 
+    def test_bare_hunk_finds_unique_context_away_from_line_one(self):
+        (self.root / "edit.txt").write_text("header\nnoise\nalpha\nbeta\ngamma\n")
+        patch = """*** Begin Patch
+*** Update File: edit.txt
+@@
+ alpha
+-beta
++BETA
+ gamma
+*** End Patch
+"""
+
+        apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual((self.root / "edit.txt").read_text(), "header\nnoise\nalpha\nBETA\ngamma\n")
+
+    def test_bare_hunk_rejects_ambiguous_context(self):
+        (self.root / "edit.txt").write_text("alpha\nbeta\nalpha\nbeta\n")
+        patch = """*** Begin Patch
+*** Update File: edit.txt
+@@
+ alpha
+-beta
++BETA
+*** End Patch
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "patch_conflict")
+        self.assertEqual(raised.exception.details["candidate_lines"], [1, 3])
+
+    def test_explicit_hunk_prefers_match_nearest_declared_line(self):
+        target = self.root / "edit.txt"
+        target.write_text("alpha\nbeta\nnoise\nalpha\nbeta\n")
+        patch = """--- a/edit.txt
++++ b/edit.txt
+@@ -4,2 +4,2 @@
+ alpha
+-beta
++BETA
+"""
+
+        apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(target.read_text(), "alpha\nbeta\nnoise\nalpha\nBETA\n")
+
+    def test_multiple_hunks_apply_in_order(self):
+        target = self.root / "edit.txt"
+        target.write_text("one\ntwo\nthree\nfour\nfive\n")
+        patch = """--- a/edit.txt
++++ b/edit.txt
+@@ -1,2 +1,2 @@
+ one
+-two
++TWO
+@@ -4,2 +4,2 @@
+ four
+-five
++FIVE
+"""
+
+        apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(target.read_text(), "one\nTWO\nthree\nfour\nFIVE\n")
+
+    def test_invalid_hunk_counts_do_not_modify_file(self):
+        target = self.root / "edit.txt"
+        original = "alpha\nbeta\n"
+        target.write_text(original)
+        patch = """--- a/edit.txt
++++ b/edit.txt
+@@ -1,3 +1,2 @@
+ alpha
+-beta
++BETA
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "invalid_patch")
+        self.assertEqual(target.read_text(), original)
+
+    def test_validation_failure_in_later_file_keeps_all_files_unchanged(self):
+        first = self.root / "first.txt"
+        second = self.root / "second.txt"
+        first.write_text("old first\n")
+        second.write_text("old second\n")
+        patch = """--- a/first.txt
++++ b/first.txt
+@@ -1 +1 @@
+-old first
++new first
+--- a/second.txt
++++ b/second.txt
+@@ -1 +1 @@
+-does not match
++new second
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "patch_conflict")
+        self.assertEqual(first.read_text(), "old first\n")
+        self.assertEqual(second.read_text(), "old second\n")
+
+    def test_create_existing_file_is_rejected_without_overwrite(self):
+        target = self.root / "existing.txt"
+        target.write_text("keep\n")
+        patch = """*** Begin Patch
+*** Add File: existing.txt
++replacement
+*** End Patch
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "patch_conflict")
+        self.assertEqual(target.read_text(), "keep\n")
+
+    def test_update_missing_file_reports_file_not_found(self):
+        patch = """*** Begin Patch
+*** Update File: missing.txt
+@@
+-old
++new
+*** End Patch
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "file_not_found")
+
+    def test_patch_rejects_parent_traversal(self):
+        patch = """*** Begin Patch
+*** Add File: ../escape.txt
++nope
+*** End Patch
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertIn(raised.exception.code, {"invalid_path", "path_outside_workspace"})
+        self.assertFalse((self.root.parent / "escape.txt").exists())
+
+    def test_update_preserves_file_mode(self):
+        target = self.root / "run.sh"
+        target.write_text("#!/bin/sh\necho old\n")
+        target.chmod(0o755)
+        patch = """*** Begin Patch
+*** Update File: run.sh
+@@
+-echo old
++echo new
+*** End Patch
+"""
+
+        apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    def test_malformed_apply_patch_envelope_is_rejected(self):
+        patch = """*** Begin Patch
+*** Add File: a.txt
++hello
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "invalid_patch")
+
+    def test_bare_hunk_without_context_is_rejected(self):
+        (self.root / "edit.txt").write_text("alpha\n")
+        patch = """*** Begin Patch
+*** Update File: edit.txt
+@@
++insert only
+*** End Patch
+"""
+
+        with self.assertRaises(AgentError) as raised:
+            apply_unified_patch(self.workspace, patch)
+
+        self.assertEqual(raised.exception.code, "invalid_patch")
+
 
 class OpenAPITests(unittest.TestCase):
     def test_all_descriptions_are_at_most_300_characters(self):

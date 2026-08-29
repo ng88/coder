@@ -382,8 +382,11 @@ def _parse_apply_patch_format(patch_text: str) -> list[FilePatch]:
                 old_start = int(match.group(1))
                 new_start = int(match.group(3))
             else:
-                old_start = 1
-                new_start = 1
+                # A bare @@ hunk is intentionally unanchored. The apply phase
+                # will locate its old-side context uniquely in the remaining
+                # source instead of assuming line 1.
+                old_start = -1
+                new_start = -1
             i += 1
 
             body: list[str] = []
@@ -476,9 +479,15 @@ def parse_unified_diff(patch_text: str) -> list[FilePatch]:
 
 
 def _find_hunk_target(source: list[str], hunk: PatchHunk, minimum_index: int) -> int:
-    expected = max(hunk.old_start - 1, 0)
+    unanchored = hunk.old_start == -1
+    expected = minimum_index if unanchored else max(hunk.old_start - 1, 0)
     old_lines = [line[1:] for line in hunk.lines if line[:1] in (" ", "-")]
     if not old_lines:
+        if unanchored:
+            raise AgentError(
+                "invalid_patch",
+                "Bare @@ hunks must contain context or removed lines so their location is unambiguous.",
+            )
         if expected < minimum_index or expected > len(source):
             raise AgentError("patch_conflict", "Patch hunk position is inconsistent with file content.")
         return expected
@@ -498,6 +507,15 @@ def _find_hunk_target(source: list[str], hunk: PatchHunk, minimum_index: int) ->
                 "expected_excerpt": [line.rstrip("\r\n") for line in old_lines[:8]],
                 "actual_excerpt": [line.rstrip("\r\n") for line in actual_excerpt[:8]],
                 "line_endings": "CRLF" if any(line.endswith("\r\n") for line in source) else "LF",
+            },
+        )
+    if unanchored and len(candidates) != 1:
+        raise AgentError(
+            "patch_conflict",
+            "Bare @@ hunk context matches multiple locations; add more context or explicit line numbers.",
+            details={
+                "candidate_lines": [start + 1 for start in candidates[:20]],
+                "match_count": len(candidates),
             },
         )
     return min(candidates, key=lambda start: (abs(start - expected), start))
