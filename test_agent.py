@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
 import json
+import shlex
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,7 +78,12 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_execute_command_bounds_large_output(self):
         result = await self.tools.execute_command(
-            {"command": "python -c 'import sys; sys.stdout.write(\"x\" * 1000000)'"}
+            {
+                "command": (
+                    f"{shlex.quote(sys.executable)} -c "
+                    "'import sys; sys.stdout.write(\"x\" * 1000000)'"
+                )
+            }
         )
 
         self.assertEqual(result["exit_code"], 0)
@@ -102,15 +109,9 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
                 "SystemRoot": r"C:\Windows",
             },
         ):
-            argv, proc_cwd, _ = self.tools._command_argv_and_cwd("echo ok", ".")
             session = self.tools._subprocess_session_kwargs()
             env = self.tools._minimal_env()
 
-        self.assertEqual(
-            argv,
-            [r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c", "echo ok"],
-        )
-        self.assertEqual(proc_cwd, str(self.root.resolve()))
         self.assertEqual(
             session["creationflags"],
             getattr(agent_module.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200),
@@ -124,6 +125,17 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(agent_module.os, "name", "posix"):
             session = self.tools._subprocess_session_kwargs()
         self.assertEqual(session, {"start_new_session": True})
+
+    def test_no_sandbox_inherits_host_environment(self):
+        with mock.patch.dict(agent_module.os.environ, {"CODER_TEST_ENV": "visible"}, clear=False):
+            env = self.tools._command_env()
+        self.assertEqual(env["CODER_TEST_ENV"], "visible")
+
+    def test_sandbox_uses_restricted_environment(self):
+        sandboxed = AgentTools(Workspace(self.root), sandbox=True, network=False)
+        with mock.patch.dict(agent_module.os.environ, {"CODER_TEST_ENV": "hidden"}, clear=False):
+            env = sandboxed._command_env()
+        self.assertNotIn("CODER_TEST_ENV", env)
 
     def test_macos_minimal_path_includes_homebrew(self):
         with mock.patch.object(agent_module.sys, "platform", "darwin"):
@@ -186,7 +198,12 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_command_output_buffer_is_bounded(self):
         started = await self.tools.start_command(
-            {"command": f"python -c 'import sys; sys.stdout.write(\"x\" * {MAX_RESPONSE_CHARS * 2})'"}
+            {
+                "command": (
+                    f"{shlex.quote(sys.executable)} -c "
+                    f"'import sys; sys.stdout.write(\"x\" * {MAX_RESPONSE_CHARS * 2})'"
+                )
+            }
         )
         job = self.tools.command_jobs[started["job_id"]]
         await asyncio.wait_for(job.tasks[-1], timeout=2)

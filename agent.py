@@ -727,6 +727,11 @@ class AgentTools:
             return {"creationflags": new_process_group}
         return {"start_new_session": True}
 
+    def _command_env(self) -> dict[str, str]:
+        if not self.sandbox:
+            return os.environ.copy()
+        return self._minimal_env()
+
     async def execute_command(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = payload.get("command")
         if not isinstance(command, str) or not command.strip():
@@ -738,7 +743,7 @@ class AgentTools:
 
         argv, proc_cwd, _ = self._command_argv_and_cwd(command, payload.get("cwd"))
 
-        env = self._minimal_env()
+        env = self._command_env()
         started = time.monotonic()
 
         try:
@@ -796,7 +801,7 @@ class AgentTools:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=proc_cwd,
-                env=self._minimal_env(),
+                env=self._command_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **self._subprocess_session_kwargs(),
