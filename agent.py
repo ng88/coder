@@ -42,6 +42,7 @@ import secrets
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -712,9 +713,19 @@ class AgentTools:
                 argv = self._build_bwrap_command(command, cwd_sandbox)
                 proc_cwd = str(self.workspace.root)
         else:
-            argv = ["/bin/bash", "-lc", command]
+            if os.name == "nt":
+                argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+            else:
+                argv = ["/bin/bash", "-lc", command]
             proc_cwd = str(cwd_host)
         return argv, proc_cwd, safe_relative_display(cwd_host, self.workspace.root)
+
+    @staticmethod
+    def _subprocess_session_kwargs() -> dict[str, Any]:
+        if os.name == "nt":
+            new_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            return {"creationflags": new_process_group}
+        return {"start_new_session": True}
 
     async def execute_command(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = payload.get("command")
@@ -737,7 +748,7 @@ class AgentTools:
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
+                **self._subprocess_session_kwargs(),
             )
         except FileNotFoundError as exc:
             raise AgentError("execution_failed", f"Unable to start command: {exc}") from exc
@@ -788,7 +799,7 @@ class AgentTools:
                 env=self._minimal_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
+                **self._subprocess_session_kwargs(),
             )
         except FileNotFoundError as exc:
             raise AgentError("execution_failed", f"Unable to start command: {exc}") from exc
@@ -1095,6 +1106,24 @@ class AgentTools:
                     yield resolved
 
     def _minimal_env(self) -> dict[str, str]:
+        if os.name == "nt":
+            keys = (
+                "PATH",
+                "Path",
+                "PATHEXT",
+                "SystemRoot",
+                "SYSTEMROOT",
+                "COMSPEC",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "USERNAME",
+            )
+            env = {key: os.environ[key] for key in keys if os.environ.get(key)}
+            env.setdefault("TEMP", tempfile.gettempdir())
+            env.setdefault("TMP", tempfile.gettempdir())
+            return env
+
         sandbox_home = "/tmp/home"
         path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         if sys.platform == "darwin":
@@ -1186,6 +1215,25 @@ class AgentTools:
     async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
             return
+
+        if os.name == "nt":
+            taskkill = shutil.which("taskkill")
+            if taskkill:
+                killer = await asyncio.create_subprocess_exec(
+                    taskkill,
+                    "/PID",
+                    str(proc.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.wait()
+            else:
+                proc.terminate()
+            await proc.wait()
+            return
+
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:

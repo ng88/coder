@@ -5,7 +5,9 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import agent as agent_module
 import server
 
 from agent import MAX_RESPONSE_CHARS, AgentError, AgentTools, RemoteAgent, Workspace, apply_unified_patch
@@ -90,6 +92,43 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(overflow)
         self.assertEqual(len(buffered), MAX_RESPONSE_CHARS * 4)
+
+    def test_windows_unsandboxed_command_uses_cmd_and_process_group(self):
+        with mock.patch.object(agent_module.os, "name", "nt"), mock.patch.dict(
+            agent_module.os.environ,
+            {
+                "COMSPEC": r"C:\Windows\System32\cmd.exe",
+                "PATH": r"C:\Windows\System32",
+                "SystemRoot": r"C:\Windows",
+            },
+        ):
+            argv, proc_cwd, _ = self.tools._command_argv_and_cwd("echo ok", ".")
+            session = self.tools._subprocess_session_kwargs()
+            env = self.tools._minimal_env()
+
+        self.assertEqual(
+            argv,
+            [r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c", "echo ok"],
+        )
+        self.assertEqual(proc_cwd, str(self.root.resolve()))
+        self.assertEqual(
+            session["creationflags"],
+            getattr(agent_module.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200),
+        )
+        self.assertNotIn("start_new_session", session)
+        self.assertEqual(env["COMSPEC"], r"C:\Windows\System32\cmd.exe")
+        self.assertEqual(env["PATH"], r"C:\Windows\System32")
+        self.assertEqual(env["SystemRoot"], r"C:\Windows")
+
+    def test_posix_processes_start_new_session(self):
+        with mock.patch.object(agent_module.os, "name", "posix"):
+            session = self.tools._subprocess_session_kwargs()
+        self.assertEqual(session, {"start_new_session": True})
+
+    def test_macos_minimal_path_includes_homebrew(self):
+        with mock.patch.object(agent_module.sys, "platform", "darwin"):
+            env = self.tools._minimal_env()
+        self.assertTrue(env["PATH"].startswith("/opt/homebrew/sbin:/opt/homebrew/bin:"))
 
     async def test_long_command_start_poll_and_incremental_offsets(self):
         started = await self.tools.start_command(
