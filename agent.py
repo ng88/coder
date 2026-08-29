@@ -1096,10 +1096,15 @@ class AgentTools:
 
     def _minimal_env(self) -> dict[str, str]:
         sandbox_home = "/tmp/home"
+        path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         if sys.platform == "darwin":
             sandbox_home = tempfile.gettempdir()
+            # Apple Silicon Homebrew installs under /opt/homebrew by default.
+            # Keep the environment deterministic while exposing the two common
+            # macOS package-manager executable locations.
+            path = "/opt/homebrew/sbin:/opt/homebrew/bin:" + path
         env = {
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": path,
             "HOME": sandbox_home if self.sandbox else tempfile.gettempdir(),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", ""),
