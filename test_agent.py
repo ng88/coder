@@ -186,6 +186,9 @@ class OpenAPITests(unittest.TestCase):
         too_long = [(path, len(text)) for path, text in descriptions if len(text) > 300]
         self.assertEqual(too_long, [])
 
+    def test_already_exists_maps_to_conflict(self):
+        self.assertEqual(server.status_for_agent_error("already_exists"), 409)
+
 
 if __name__ == "__main__":
     unittest.main()

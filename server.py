@@ -320,7 +320,7 @@ def status_for_agent_error(code: str) -> int:
         return 401
     if code in {"file_not_found", "machine_not_connected"}:
         return 404
-    if code in {"patch_conflict"}:
+    if code in {"patch_conflict", "already_exists"}:
         return 409
     if code in {
         "invalid_request",
