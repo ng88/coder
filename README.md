@@ -1,6 +1,6 @@
 # Coder Remote Agent
 
-`agent.py` connects a local project to a Coder GPT through a small public bridge server. The agent runs on your machine, while the GPT calls tools exposed by `server.py` and routes requests to the connected agent using the temporary token printed at startup.
+`coder` connects a local project to a Coder GPT through a small public bridge server. The agent runs on your machine, while the GPT calls tools and routes requests to the connected agent using the temporary token printed at startup.
 
 ## Quick test
 
