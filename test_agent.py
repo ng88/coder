@@ -1,11 +1,13 @@
+import asyncio
 import hashlib
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 
 import server
 
-from agent import AgentError, AgentTools, Workspace, apply_unified_patch
+from agent import MAX_RESPONSE_CHARS, AgentError, AgentTools, Workspace, apply_unified_patch
 
 
 class AgentToolTests(unittest.IsolatedAsyncioTestCase):
@@ -46,6 +48,47 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
             await self.tools.write_file({"path": "a.txt", "content": "new"})
         self.assertEqual(raised.exception.code, "already_exists")
         self.assertEqual((self.root / "a.txt").read_text(), "old")
+
+    async def test_missing_paths_are_structured_file_not_found_errors(self):
+        operations = (
+            lambda: self.tools.read_file({"path": "missing.txt"}),
+            lambda: self.tools.stat_file({"path": "missing.txt"}),
+            lambda: self.tools.delete_file({"path": "missing.txt"}),
+        )
+        for operation in operations:
+            with self.assertRaises(AgentError) as raised:
+                await operation()
+            self.assertEqual(raised.exception.code, "file_not_found")
+
+    async def test_write_file_overwrite_preserves_mode(self):
+        target = self.root / "run.sh"
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+
+        await self.tools.write_file(
+            {"path": "run.sh", "content": "#!/bin/sh\necho ok\n", "overwrite": True}
+        )
+
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    async def test_execute_command_bounds_large_output(self):
+        result = await self.tools.execute_command(
+            {"command": "python -c 'import sys; sys.stdout.write(\"x\" * 1000000)'"}
+        )
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["stdout"]), 100_000)
+
+    async def test_command_stream_reader_caps_buffered_bytes(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"x" * 1_000_000)
+        reader.feed_eof()
+
+        buffered, overflow = await self.tools._read_limited_stream(reader)
+
+        self.assertTrue(overflow)
+        self.assertEqual(len(buffered), MAX_RESPONSE_CHARS * 4)
 
     async def test_structured_mutations_reject_parent_traversal(self):
         with self.assertRaises(AgentError) as raised:

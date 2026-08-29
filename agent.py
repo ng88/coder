@@ -238,7 +238,12 @@ class Workspace:
         if p.is_absolute():
             raise AgentError("invalid_path", "Absolute host paths are not allowed.")
 
-        candidate = (self.root / p).resolve(strict=True)
+        try:
+            candidate = (self.root / p).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise AgentError("file_not_found", f"Path does not exist: {raw}") from exc
+        except OSError as exc:
+            raise AgentError("invalid_path", f"Unable to resolve path: {raw}") from exc
         if not is_relative_to(candidate, self.root):
             raise AgentError("path_outside_workspace", "Path resolves outside the project workspace.")
 
@@ -684,16 +689,19 @@ class AgentTools:
         except FileNotFoundError as exc:
             raise AgentError("execution_failed", f"Unable to start command: {exc}") from exc
 
+        stdout_task = asyncio.create_task(self._read_limited_stream(proc.stdout))
+        stderr_task = asyncio.create_task(self._read_limited_stream(proc.stderr))
         timed_out = False
         try:
             if timeout == 0:
-                stdout_b, stderr_b = await proc.communicate()
+                await proc.wait()
             else:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
             await self._terminate_process_tree(proc)
-            stdout_b, stderr_b = await proc.communicate()
+        stdout_b, stdout_overflow = await stdout_task
+        stderr_b, stderr_overflow = await stderr_task
 
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
@@ -705,7 +713,7 @@ class AgentTools:
             "stderr": stderr,
             "exit_code": None if timed_out else proc.returncode,
             "timed_out": timed_out,
-            "truncated": bool(out_trunc or err_trunc),
+            "truncated": bool(stdout_overflow or stderr_overflow or out_trunc or err_trunc),
             "duration_ms": int((time.monotonic() - started) * 1000),
         }
 
@@ -756,6 +764,7 @@ class AgentTools:
             raise AgentError("already_exists", "Target file already exists; set overwrite=true to replace it.")
         if target.exists() and not target.is_file():
             raise AgentError("invalid_path", "Target exists and is not a regular file.")
+        original_mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
         if not target.parent.exists():
             if not create_parents:
                 raise AgentError("invalid_path", "Parent directory does not exist.")
@@ -767,6 +776,8 @@ class AgentTools:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if original_mode is not None:
+                os.chmod(tmp_name, original_mode)
             os.replace(tmp_name, target)
         finally:
             if os.path.exists(tmp_name):
@@ -1040,6 +1051,28 @@ class AgentTools:
         except ProcessLookupError:
             return
         await proc.wait()
+
+    @staticmethod
+    async def _read_limited_stream(
+        stream: asyncio.StreamReader | None,
+    ) -> tuple[bytes, bool]:
+        if stream is None:
+            return b"", False
+
+        byte_limit = MAX_RESPONSE_CHARS * 4
+        kept = bytearray()
+        overflow = False
+        while True:
+            chunk = await stream.read(64 * 1024)
+            if not chunk:
+                break
+            remaining = byte_limit - len(kept)
+            if remaining > 0:
+                kept.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                overflow = True
+
+        return bytes(kept), overflow
 
 
 # ---------------------------------------------------------------------------
