@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import codecs
 import fnmatch
 import hashlib
 import json
@@ -39,7 +40,7 @@ import stat
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -104,10 +105,12 @@ def operation_detail(canonical: str, message: dict[str, Any]) -> str:
         query = short(message.get("query"), 60)
         path = short(message.get("path"), 40)
         return f"{query} @ {path}" if query and path else query or path
-    if canonical == "execute_command":
+    if canonical in {"execute_command", "start_command"}:
         command = short(message.get("command"), 70)
         cwd = short(message.get("cwd"), 30)
         return f"{command} @ {cwd}" if command and cwd else command or cwd
+    if canonical in {"poll_command", "cancel_command"}:
+        return short(message.get("job_id"), 30)
     if canonical == "apply_patch":
         patch_text = message.get("patch")
         if isinstance(patch_text, str):
@@ -667,11 +670,42 @@ def apply_unified_patch(workspace: Workspace, patch_text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class CommandJob:
+    job_id: str
+    command: str
+    cwd: str
+    proc: asyncio.subprocess.Process
+    started_at: float
+    status: str = "running"
+    finished_at: float | None = None
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    stdout_start: int = 0
+    stderr_start: int = 0
+    cancel_requested: bool = False
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+
+
 class AgentTools:
     def __init__(self, workspace: Workspace, *, sandbox: bool, network: bool):
         self.workspace = workspace
         self.sandbox = sandbox
         self.network = network
+        self.command_jobs: dict[str, CommandJob] = {}
+
+    def _command_argv_and_cwd(self, command: str, cwd_value: Any) -> tuple[list[str], str, str]:
+        cwd_host = self.workspace.resolve_existing(cwd_value or ".", want_dir=True)
+        cwd_sandbox = self.workspace.to_sandbox_path(cwd_host)
+        if self.sandbox:
+            argv = self._build_bwrap_command(command, cwd_sandbox)
+            proc_cwd = str(self.workspace.root)
+        else:
+            argv = ["/bin/bash", "-lc", command]
+            proc_cwd = str(cwd_host)
+        return argv, proc_cwd, safe_relative_display(cwd_host, self.workspace.root)
 
     async def execute_command(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = payload.get("command")
@@ -682,15 +716,7 @@ class AgentTools:
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 0:
             raise AgentError("invalid_request", "timeout must be an integer >= 0.")
 
-        cwd_host = self.workspace.resolve_existing(payload.get("cwd") or ".", want_dir=True)
-        cwd_sandbox = self.workspace.to_sandbox_path(cwd_host)
-
-        if self.sandbox:
-            argv = self._build_bwrap_command(command, cwd_sandbox)
-            proc_cwd = str(self.workspace.root)
-        else:
-            argv = ["/bin/bash", "-lc", command]
-            proc_cwd = str(cwd_host)
+        argv, proc_cwd, _ = self._command_argv_and_cwd(command, payload.get("cwd"))
 
         env = self._minimal_env()
         started = time.monotonic()
@@ -734,6 +760,78 @@ class AgentTools:
             "truncated": bool(stdout_overflow or stderr_overflow or out_trunc or err_trunc),
             "duration_ms": int((time.monotonic() - started) * 1000),
         }
+
+    async def start_command(self, payload: dict[str, Any]) -> dict[str, Any]:
+        command = payload.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise AgentError("invalid_request", "command must be a non-empty string.")
+
+        self._prune_command_jobs()
+        running = sum(1 for job in self.command_jobs.values() if job.status == "running")
+        if running >= 10:
+            raise AgentError("too_many_jobs", "At most 10 long-running commands may run concurrently.")
+
+        argv, proc_cwd, relative_cwd = self._command_argv_and_cwd(command, payload.get("cwd"))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=proc_cwd,
+                env=self._minimal_env(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            raise AgentError("execution_failed", f"Unable to start command: {exc}") from exc
+
+        job_id = secrets.token_urlsafe(12)
+        job = CommandJob(job_id, command, relative_cwd, proc, time.monotonic())
+        self.command_jobs[job_id] = job
+        job.tasks = [
+            asyncio.create_task(self._capture_job_stream(job, proc.stdout, "stdout")),
+            asyncio.create_task(self._capture_job_stream(job, proc.stderr, "stderr")),
+        ]
+        job.tasks.append(asyncio.create_task(self._monitor_command_job(job)))
+        return {"job_id": job_id, "status": "running", "command": command, "cwd": relative_cwd}
+
+    async def poll_command(self, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self._get_command_job(payload.get("job_id"))
+        stdout_offset = self._job_offset(payload.get("stdout_offset", 0), "stdout_offset")
+        stderr_offset = self._job_offset(payload.get("stderr_offset", 0), "stderr_offset")
+        wait_seconds = payload.get("wait_seconds", 0)
+        if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 0 <= wait_seconds <= 30:
+            raise AgentError("invalid_request", "wait_seconds must be an integer between 0 and 30.")
+
+        if wait_seconds:
+            async with job.condition:
+                if job.status == "running" and not self._job_has_new_output(job, stdout_offset, stderr_offset):
+                    try:
+                        await asyncio.wait_for(job.condition.wait(), timeout=wait_seconds)
+                    except asyncio.TimeoutError:
+                        pass
+
+        return self._command_job_poll_result(job, stdout_offset, stderr_offset)
+
+    async def cancel_command(self, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self._get_command_job(payload.get("job_id"))
+        if job.status == "running":
+            job.cancel_requested = True
+            await self._terminate_process_tree(job.proc)
+            await job.tasks[-1]
+        return self._command_job_summary(job)
+
+    async def list_commands(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._prune_command_jobs()
+        jobs = sorted(self.command_jobs.values(), key=lambda job: job.started_at, reverse=True)
+        return {"jobs": [self._command_job_summary(job) for job in jobs]}
+
+    async def shutdown_command_jobs(self) -> None:
+        running = [job for job in self.command_jobs.values() if job.status == "running"]
+        for job in running:
+            job.cancel_requested = True
+            await self._terminate_process_tree(job.proc)
+        if running:
+            await asyncio.gather(*(job.tasks[-1] for job in running), return_exceptions=True)
 
     async def read_file(self, payload: dict[str, Any]) -> dict[str, Any]:
         path_value = payload.get("path")
@@ -1092,6 +1190,115 @@ class AgentTools:
 
         return bytes(kept), overflow
 
+    async def _capture_job_stream(
+        self,
+        job: CommandJob,
+        stream: asyncio.StreamReader | None,
+        name: str,
+    ) -> None:
+        if stream is None:
+            return
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while True:
+            chunk = await stream.read(64 * 1024)
+            if not chunk:
+                text = decoder.decode(b"", final=True)
+                if text:
+                    await self._append_job_output(job, name, text)
+                return
+            text = decoder.decode(chunk)
+            if text:
+                await self._append_job_output(job, name, text)
+
+    async def _append_job_output(self, job: CommandJob, name: str, text: str) -> None:
+        async with job.condition:
+            value = getattr(job, name) + text
+            start_name = f"{name}_start"
+            start = getattr(job, start_name)
+            if len(value) > MAX_RESPONSE_CHARS:
+                drop = len(value) - MAX_RESPONSE_CHARS
+                value = value[drop:]
+                start += drop
+            setattr(job, name, value)
+            setattr(job, start_name, start)
+            job.condition.notify_all()
+
+    async def _monitor_command_job(self, job: CommandJob) -> None:
+        await job.proc.wait()
+        await asyncio.gather(*job.tasks[:2], return_exceptions=True)
+        job.exit_code = job.proc.returncode
+        job.finished_at = time.monotonic()
+        job.status = "cancelled" if job.cancel_requested else "exited"
+        async with job.condition:
+            job.condition.notify_all()
+
+    def _get_command_job(self, job_id: Any) -> CommandJob:
+        if not isinstance(job_id, str) or not job_id:
+            raise AgentError("invalid_request", "job_id must be a non-empty string.")
+        job = self.command_jobs.get(job_id)
+        if job is None:
+            raise AgentError("job_not_found", "Command job was not found.")
+        return job
+
+    @staticmethod
+    def _job_offset(value: Any, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise AgentError("invalid_request", f"{name} must be an integer >= 0.")
+        return value
+
+    @staticmethod
+    def _job_has_new_output(job: CommandJob, stdout_offset: int, stderr_offset: int) -> bool:
+        return (
+            stdout_offset < job.stdout_start + len(job.stdout)
+            or stderr_offset < job.stderr_start + len(job.stderr)
+        )
+
+    def _command_job_poll_result(
+        self,
+        job: CommandJob,
+        stdout_offset: int,
+        stderr_offset: int,
+    ) -> dict[str, Any]:
+        stdout_truncated = stdout_offset < job.stdout_start
+        stderr_truncated = stderr_offset < job.stderr_start
+        stdout_from = max(stdout_offset, job.stdout_start)
+        stderr_from = max(stderr_offset, job.stderr_start)
+        stdout_index = stdout_from - job.stdout_start
+        stderr_index = stderr_from - job.stderr_start
+        result = self._command_job_summary(job)
+        result.update(
+            {
+                "stdout": job.stdout[stdout_index:],
+                "stderr": job.stderr[stderr_index:],
+                "stdout_offset": job.stdout_start + len(job.stdout),
+                "stderr_offset": job.stderr_start + len(job.stderr),
+                "truncated": stdout_truncated or stderr_truncated,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _command_job_summary(job: CommandJob) -> dict[str, Any]:
+        end = job.finished_at if job.finished_at is not None else time.monotonic()
+        return {
+            "job_id": job.job_id,
+            "command": job.command,
+            "cwd": job.cwd,
+            "status": job.status,
+            "exit_code": job.exit_code,
+            "duration_ms": int((end - job.started_at) * 1000),
+        }
+
+    def _prune_command_jobs(self) -> None:
+        finished = sorted(
+            (job for job in self.command_jobs.values() if job.status != "running"),
+            key=lambda job: job.finished_at or job.started_at,
+            reverse=True,
+        )
+        for job in finished[50:]:
+            self.command_jobs.pop(job.job_id, None)
+
 
 # ---------------------------------------------------------------------------
 # WebSocket client
@@ -1101,6 +1308,10 @@ class AgentTools:
 TOOL_ALIASES = {
     "exec": "execute_command",
     "execute_command": "execute_command",
+    "start_command": "start_command",
+    "poll_command": "poll_command",
+    "cancel_command": "cancel_command",
+    "list_commands": "list_commands",
     "read_file": "read_file",
     "write_file": "write_file",
     "delete_file": "delete_file",
@@ -1205,25 +1416,40 @@ class RemoteAgent:
         await ws.send(json.dumps({"type": "hello", "machine_id": self.identity.machine_id}))
 
     async def _connection_loop(self, ws: Any) -> None:
-        async for raw in ws:
-            try:
-                message = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                await ws.send(json.dumps({"type": "error", "code": "invalid_json"}))
-                continue
+        poll_tasks: set[asyncio.Task[None]] = set()
+        try:
+            async for raw in ws:
+                try:
+                    message = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    await ws.send(json.dumps({"type": "error", "code": "invalid_json"}))
+                    continue
 
-            if not isinstance(message, dict):
-                await ws.send(json.dumps({"type": "error", "code": "invalid_message"}))
-                continue
+                if not isinstance(message, dict):
+                    await ws.send(json.dumps({"type": "error", "code": "invalid_message"}))
+                    continue
 
-            # Registration collision: regenerate the entire temporary token and retry.
-            if message.get("type") == "error" and message.get("code") == "machine_id_collision":
-                self.identity = AgentIdentity.generate()
-                self.print_identity(replaced=True)
-                await self._send_hello(ws)
-                continue
+                # Registration collision: regenerate the entire temporary token and retry.
+                if message.get("type") == "error" and message.get("code") == "machine_id_collision":
+                    self.identity = AgentIdentity.generate()
+                    self.print_identity(replaced=True)
+                    await self._send_hello(ws)
+                    continue
 
-            await self._handle_message(ws, message)
+                # Long polls must not block later cancel/list requests arriving on
+                # the same WebSocket connection.
+                if TOOL_ALIASES.get(str(message.get("type"))) == "poll_command":
+                    task = asyncio.create_task(self._handle_message(ws, message))
+                    poll_tasks.add(task)
+                    task.add_done_callback(poll_tasks.discard)
+                    continue
+
+                await self._handle_message(ws, message)
+        finally:
+            for task in poll_tasks:
+                task.cancel()
+            if poll_tasks:
+                await asyncio.gather(*poll_tasks, return_exceptions=True)
 
     async def _handle_message(self, ws: Any, message: dict[str, Any]) -> None:
         op_type = message.get("type")
@@ -1241,48 +1467,59 @@ class RemoteAgent:
             await ws.send(json.dumps({"type": "error", "code": "missing_request_id"}))
             return
 
-        async with self.operation_lock:
-            started = time.monotonic()
-            detail = operation_detail(canonical, message)
-            try:
-                token = message.get("token")
-                if not isinstance(token, str) or not self.identity.matches(token):
-                    raise AgentError("invalid_token", "Invalid agent token.")
+        if canonical in {"poll_command", "cancel_command", "list_commands"}:
+            await self._run_operation(ws, message, canonical, request_id)
+        else:
+            async with self.operation_lock:
+                await self._run_operation(ws, message, canonical, request_id)
 
-                handler = getattr(self.tools, canonical)
-                result = await handler(message)
-                response = {"type": "result", "request_id": request_id, "result": result}
-                elapsed = time.monotonic() - started
-                line = colorize("DONE", ANSI_GREEN, ANSI_BOLD)
-                line += " " + colorize(canonical, ANSI_CYAN, ANSI_BOLD)
-                if detail:
-                    line += " " + colorize(detail, ANSI_YELLOW)
-                line += colorize(f" ({elapsed:.2f}s)", ANSI_GREEN)
-                print(line, flush=True)
-            except AgentError as exc:
-                response = {"type": "result", "request_id": request_id, "error": exc.to_dict()}
-                elapsed = time.monotonic() - started
-                line = colorize("FAIL", ANSI_RED, ANSI_BOLD)
-                line += " " + colorize(canonical, ANSI_CYAN, ANSI_BOLD)
-                if detail:
-                    line += " " + colorize(detail, ANSI_YELLOW)
-                line += colorize(f" [{exc.code}] ({elapsed:.2f}s)", ANSI_RED)
-                print(line, file=sys.stderr, flush=True)
-            except Exception as exc:
-                response = {
-                    "type": "result",
-                    "request_id": request_id,
-                    "error": {"code": "internal_error", "message": "Unhandled agent error."},
-                }
-                elapsed = time.monotonic() - started
-                line = colorize("FAIL", ANSI_RED, ANSI_BOLD)
-                line += " " + colorize(canonical, ANSI_CYAN, ANSI_BOLD)
-                if detail:
-                    line += " " + colorize(detail, ANSI_YELLOW)
-                line += colorize(f" [internal_error] ({elapsed:.2f}s)", ANSI_RED)
-                print(line, file=sys.stderr, flush=True)
+    async def _run_operation(
+        self,
+        ws: Any,
+        message: dict[str, Any],
+        canonical: str,
+        request_id: str,
+    ) -> None:
+        started = time.monotonic()
+        detail = operation_detail(canonical, message)
+        try:
+            token = message.get("token")
+            if not isinstance(token, str) or not self.identity.matches(token):
+                raise AgentError("invalid_token", "Invalid agent token.")
 
-            await ws.send(json.dumps(response, ensure_ascii=False))
+            handler = getattr(self.tools, canonical)
+            result = await handler(message)
+            response = {"type": "result", "request_id": request_id, "result": result}
+            elapsed = time.monotonic() - started
+            line = colorize("DONE", ANSI_GREEN, ANSI_BOLD)
+            line += " " + colorize(canonical, ANSI_CYAN, ANSI_BOLD)
+            if detail:
+                line += " " + colorize(detail, ANSI_YELLOW)
+            line += colorize(f" ({elapsed:.2f}s)", ANSI_GREEN)
+            print(line, flush=True)
+        except AgentError as exc:
+            response = {"type": "result", "request_id": request_id, "error": exc.to_dict()}
+            elapsed = time.monotonic() - started
+            line = colorize("FAIL", ANSI_RED, ANSI_BOLD)
+            line += " " + colorize(canonical, ANSI_CYAN, ANSI_BOLD)
+            if detail:
+                line += " " + colorize(detail, ANSI_YELLOW)
+            line += colorize(f" [{exc.code}] ({elapsed:.2f}s)", ANSI_RED)
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            response = {
+                "type": "result",
+                "request_id": request_id,
+                "error": {"code": "internal_error", "message": "Unhandled agent error."},
+            }
+            elapsed = time.monotonic() - started
+            line = colorize("FAIL", ANSI_RED, ANSI_BOLD)
+            line += " " + colorize(canonical, ANSI_CYAN, ANSI_BOLD)
+            if detail:
+                line += " " + colorize(detail, ANSI_YELLOW)
+            line += colorize(f" [internal_error] ({elapsed:.2f}s)", ANSI_RED)
+            print(line, file=sys.stderr, flush=True)
+        await ws.send(json.dumps(response, ensure_ascii=False))
 
     async def _send_error(self, ws: Any, request_id: Any, code: str, message: str) -> None:
         await ws.send(
@@ -1369,6 +1606,7 @@ async def async_main() -> None:
         await agent.run_forever()
     finally:
         copy_task.cancel()
+        await agent.tools.shutdown_command_jobs()
         await asyncio.gather(copy_task, return_exceptions=True)
 
 

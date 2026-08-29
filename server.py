@@ -128,6 +128,26 @@ class ExecuteCommandRequest(TokenRequest):
     )
 
 
+class StartCommandRequest(TokenRequest):
+    command: str = Field(..., min_length=1, max_length=MAX_COMMAND_CHARS)
+    cwd: str | None = Field(default=None, max_length=MAX_PATH_CHARS)
+
+
+class PollCommandRequest(TokenRequest):
+    job_id: str = Field(..., min_length=1, max_length=200)
+    stdout_offset: int = Field(default=0, ge=0)
+    stderr_offset: int = Field(default=0, ge=0)
+    wait_seconds: int = Field(default=0, ge=0, le=30)
+
+
+class CommandJobRequest(TokenRequest):
+    job_id: str = Field(..., min_length=1, max_length=200)
+
+
+class ListCommandsRequest(TokenRequest):
+    pass
+
+
 class ReadFileRequest(TokenRequest):
     path: str = Field(
         ...,
@@ -205,6 +225,34 @@ class CommandResult(BaseModel):
     timed_out: bool
     truncated: bool = False
     duration_ms: int | None = None
+
+
+class CommandJobSummary(BaseModel):
+    job_id: str
+    command: str
+    cwd: str
+    status: str
+    exit_code: int | None
+    duration_ms: int
+
+
+class StartCommandResult(BaseModel):
+    job_id: str
+    status: str
+    command: str
+    cwd: str
+
+
+class PollCommandResult(CommandJobSummary):
+    stdout: str
+    stderr: str
+    stdout_offset: int
+    stderr_offset: int
+    truncated: bool
+
+
+class ListCommandsResult(BaseModel):
+    jobs: list[CommandJobSummary]
 
 
 class ReadFileResult(BaseModel):
@@ -318,9 +366,9 @@ def error_payload(code: str, message: str, *, details: dict[str, Any] | None = N
 def status_for_agent_error(code: str) -> int:
     if code == "invalid_token":
         return 401
-    if code in {"file_not_found", "machine_not_connected"}:
+    if code in {"file_not_found", "machine_not_connected", "job_not_found"}:
         return 404
-    if code in {"patch_conflict", "already_exists"}:
+    if code in {"patch_conflict", "already_exists", "too_many_jobs"}:
         return 409
     if code in {
         "invalid_request",
@@ -632,6 +680,54 @@ async def _run_tool(operation: str, model: BaseModel, *, timeout: float | None) 
 async def execute_command(request: ExecuteCommandRequest) -> JSONResponse | dict[str, Any]:
     bridge_timeout = None if request.timeout == 0 else float(request.timeout) + COMMAND_TIMEOUT_GRACE
     return await _run_tool("execute_command", request, timeout=bridge_timeout)
+
+
+@app.post(
+    "/api/start-command",
+    operation_id="startCommand",
+    summary="Start a long-running Bash command",
+    response_model=StartCommandResult,
+    responses=ERROR_RESPONSES,
+)
+async def start_command(request: StartCommandRequest) -> JSONResponse | dict[str, Any]:
+    return await _run_tool("start_command", request, timeout=DEFAULT_TOOL_BRIDGE_TIMEOUT)
+
+
+@app.post(
+    "/api/poll-command",
+    operation_id="pollCommand",
+    summary="Poll a long-running command and read new output",
+    response_model=PollCommandResult,
+    responses=ERROR_RESPONSES,
+)
+async def poll_command(request: PollCommandRequest) -> JSONResponse | dict[str, Any]:
+    return await _run_tool(
+        "poll_command",
+        request,
+        timeout=float(request.wait_seconds) + DEFAULT_TOOL_BRIDGE_TIMEOUT,
+    )
+
+
+@app.post(
+    "/api/cancel-command",
+    operation_id="cancelCommand",
+    summary="Cancel a long-running command",
+    response_model=CommandJobSummary,
+    responses=ERROR_RESPONSES,
+)
+async def cancel_command(request: CommandJobRequest) -> JSONResponse | dict[str, Any]:
+    return await _run_tool("cancel_command", request, timeout=DEFAULT_TOOL_BRIDGE_TIMEOUT)
+
+
+@app.post(
+    "/api/list-commands",
+    operation_id="listCommands",
+    summary="List recent and running command jobs",
+    response_model=ListCommandsResult,
+    responses=ERROR_RESPONSES,
+)
+async def list_commands(request: ListCommandsRequest) -> JSONResponse | dict[str, Any]:
+    return await _run_tool("list_commands", request, timeout=DEFAULT_TOOL_BRIDGE_TIMEOUT)
 
 
 @app.post(

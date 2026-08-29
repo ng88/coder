@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import stat
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import server
 
-from agent import MAX_RESPONSE_CHARS, AgentError, AgentTools, Workspace, apply_unified_patch
+from agent import MAX_RESPONSE_CHARS, AgentError, AgentTools, RemoteAgent, Workspace, apply_unified_patch
 
 
 class AgentToolTests(unittest.IsolatedAsyncioTestCase):
@@ -89,6 +90,146 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(overflow)
         self.assertEqual(len(buffered), MAX_RESPONSE_CHARS * 4)
+
+    async def test_long_command_start_poll_and_incremental_offsets(self):
+        started = await self.tools.start_command(
+            {"command": "printf 'first\\n'; sleep 0.1; printf 'second\\n'"}
+        )
+        job_id = started["job_id"]
+        self.assertEqual(started["status"], "running")
+
+        first = await self.tools.poll_command({"job_id": job_id, "wait_seconds": 1})
+        self.assertIn("first\n", first["stdout"])
+
+        final = first
+        while final["status"] == "running":
+            final = await self.tools.poll_command(
+                {
+                    "job_id": job_id,
+                    "stdout_offset": final["stdout_offset"],
+                    "stderr_offset": final["stderr_offset"],
+                    "wait_seconds": 1,
+                }
+            )
+
+        self.assertEqual(final["status"], "exited")
+        self.assertEqual(final["exit_code"], 0)
+        if "second\n" not in final["stdout"]:
+            all_output = await self.tools.poll_command({"job_id": job_id})
+            self.assertIn("second\n", all_output["stdout"])
+
+    async def test_long_command_cancel_terminates_job(self):
+        started = await self.tools.start_command({"command": "sleep 30"})
+
+        cancelled = await self.tools.cancel_command({"job_id": started["job_id"]})
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertIsNotNone(cancelled["exit_code"])
+
+    async def test_shutdown_terminates_all_running_long_commands(self):
+        first = await self.tools.start_command({"command": "sleep 30"})
+        second = await self.tools.start_command({"command": "sleep 30"})
+
+        await self.tools.shutdown_command_jobs()
+
+        for job_id in (first["job_id"], second["job_id"]):
+            job = self.tools.command_jobs[job_id]
+            self.assertEqual(job.status, "cancelled")
+            self.assertIsNotNone(job.exit_code)
+
+    async def test_list_commands_includes_started_jobs(self):
+        started = await self.tools.start_command({"command": "printf done"})
+        await self.tools.poll_command({"job_id": started["job_id"], "wait_seconds": 1})
+
+        result = await self.tools.list_commands({})
+
+        self.assertIn(started["job_id"], {job["job_id"] for job in result["jobs"]})
+
+    async def test_long_command_output_buffer_is_bounded(self):
+        started = await self.tools.start_command(
+            {"command": f"python -c 'import sys; sys.stdout.write(\"x\" * {MAX_RESPONSE_CHARS * 2})'"}
+        )
+        job = self.tools.command_jobs[started["job_id"]]
+        await asyncio.wait_for(job.tasks[-1], timeout=2)
+        result = await self.tools.poll_command({"job_id": started["job_id"]})
+
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["stdout"]), MAX_RESPONSE_CHARS)
+        self.assertEqual(result["stdout_offset"], MAX_RESPONSE_CHARS * 2)
+
+    async def test_unknown_long_command_job_is_structured_error(self):
+        with self.assertRaises(AgentError) as raised:
+            await self.tools.poll_command({"job_id": "missing"})
+        self.assertEqual(raised.exception.code, "job_not_found")
+
+    async def test_long_command_tracks_stdout_and_stderr_offsets_independently(self):
+        started = await self.tools.start_command(
+            {"command": "printf out; printf err >&2"}
+        )
+        job = self.tools.command_jobs[started["job_id"]]
+        await asyncio.wait_for(job.tasks[-1], timeout=2)
+
+        first = await self.tools.poll_command({"job_id": started["job_id"]})
+        self.assertEqual(first["stdout"], "out")
+        self.assertEqual(first["stderr"], "err")
+
+        second = await self.tools.poll_command(
+            {
+                "job_id": started["job_id"],
+                "stdout_offset": first["stdout_offset"],
+                "stderr_offset": first["stderr_offset"],
+            }
+        )
+        self.assertEqual(second["stdout"], "")
+        self.assertEqual(second["stderr"], "")
+
+    async def test_remote_long_poll_does_not_block_cancel_request(self):
+        agent = RemoteAgent("ws://example.invalid", self.workspace, sandbox=False, network=False)
+        started = await agent.tools.start_command({"command": "sleep 30"})
+        token = agent.identity.token
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.index = 0
+                self.sent: list[dict] = []
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.index += 1
+                if self.index == 1:
+                    return json.dumps(
+                        {
+                            "type": "poll_command",
+                            "request_id": "poll",
+                            "token": token,
+                            "job_id": started["job_id"],
+                            "wait_seconds": 30,
+                        }
+                    )
+                if self.index == 2:
+                    await asyncio.sleep(0.05)
+                    return json.dumps(
+                        {
+                            "type": "cancel_command",
+                            "request_id": "cancel",
+                            "token": token,
+                            "job_id": started["job_id"],
+                        }
+                    )
+                await asyncio.sleep(0.05)
+                raise StopAsyncIteration
+
+            async def send(self, raw: str):
+                self.sent.append(json.loads(raw))
+
+        ws = FakeWebSocket()
+        await asyncio.wait_for(agent._connection_loop(ws), timeout=2)
+
+        responses = {message.get("request_id"): message for message in ws.sent}
+        self.assertEqual(responses["cancel"]["result"]["status"], "cancelled")
+        self.assertIn(responses["poll"]["result"]["status"], {"cancelled", "exited"})
 
     async def test_structured_mutations_reject_parent_traversal(self):
         with self.assertRaises(AgentError) as raised:
@@ -380,6 +521,22 @@ class OpenAPITests(unittest.TestCase):
 
     def test_already_exists_maps_to_conflict(self):
         self.assertEqual(server.status_for_agent_error("already_exists"), 409)
+
+    def test_command_job_errors_map_to_expected_statuses(self):
+        self.assertEqual(server.status_for_agent_error("job_not_found"), 404)
+        self.assertEqual(server.status_for_agent_error("too_many_jobs"), 409)
+
+    def test_long_command_operations_are_exposed_in_openapi(self):
+        schema = server.app.openapi()
+        operation_ids = {
+            operation["operationId"]
+            for path in schema["paths"].values()
+            for operation in path.values()
+            if isinstance(operation, dict) and "operationId" in operation
+        }
+        self.assertTrue(
+            {"startCommand", "pollCommand", "cancelCommand", "listCommands"}.issubset(operation_ids)
+        )
 
 
 if __name__ == "__main__":
