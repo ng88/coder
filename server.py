@@ -79,6 +79,8 @@ MAX_WS_CONNECTIONS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_CONNECTIONS_PER_
 MAX_WS_CONNECTIONS_GLOBAL = int(os.environ.get("REMOTE_AGENT_WS_CONNECTIONS_GLOBAL", "2000"))
 MAX_WS_CONNECTION_ATTEMPTS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_ATTEMPTS_PER_MINUTE", "120"))
 WS_CONNECTION_ATTEMPT_WINDOW = 60.0
+MAX_WS_HELLO_ATTEMPTS = int(os.environ.get("REMOTE_AGENT_WS_HELLO_ATTEMPTS", "3"))
+WS_HELLO_TIMEOUT = float(os.environ.get("REMOTE_AGENT_WS_HELLO_TIMEOUT", "30"))
 
 # Bound HTTP request bodies before FastAPI/Pydantic parses them. 4 MiB leaves
 # ample headroom for the 500k-character tool fields, including JSON escaping
@@ -851,9 +853,11 @@ async def agent_websocket(websocket: WebSocket) -> None:
     try:
         # Registration may repeat on the same socket after a machine_id collision;
         # the current agent regenerates its full token and sends another hello.
-        while conn is None:
+        # Bound failed attempts so an unauthenticated socket cannot stay alive
+        # indefinitely by sending malformed hellos just before each timeout.
+        for _attempt in range(MAX_WS_HELLO_ATTEMPTS):
             try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=WS_HELLO_TIMEOUT)
             except asyncio.TimeoutError:
                 close_reason = "registration_timeout"
                 await websocket.close(code=1008, reason="hello timeout")
@@ -875,6 +879,13 @@ async def agent_websocket(websocket: WebSocket) -> None:
                 continue
 
             conn = await state.register(machine_id, websocket)
+            if conn is not None:
+                break
+
+        if conn is None:
+            close_reason = "registration_attempts_exhausted"
+            await websocket.close(code=1008, reason="too many failed hello attempts")
+            return
 
         while True:
             raw = await websocket.receive_text()

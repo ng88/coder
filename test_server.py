@@ -1,10 +1,11 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 import server
-from server import HttpRateLimitMiddleware, MAX_WRITE_CONTENT_CHARS, RequestBodyLimitMiddleware, ServerState, WriteFileRequest
+from server import HttpRateLimitMiddleware, MAX_WRITE_CONTENT_CHARS, RequestBodyLimitMiddleware, ServerState, WriteFileRequest, agent_websocket
 
 
 def run_asgi(middleware, scope, incoming):
@@ -130,3 +131,33 @@ def test_websocket_global_connection_limit(monkeypatch):
 
     state.release_ws_slot("203.0.113.1")
     assert state.acquire_ws_slot("203.0.113.3") is None
+
+
+def test_websocket_registration_closes_after_three_failed_hellos(monkeypatch):
+    monkeypatch.setattr(server, "MAX_WS_HELLO_ATTEMPTS", 3)
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.client = SimpleNamespace(host="203.0.113.50", port=12345)
+            self.headers = {}
+            self.errors = []
+            self.closed = None
+            self.messages = iter(["not-json", "not-json", "not-json"])
+
+        async def accept(self):
+            pass
+
+        async def receive_text(self):
+            return next(self.messages)
+
+        async def send_json(self, message):
+            self.errors.append(message)
+
+        async def close(self, *, code, reason):
+            self.closed = (code, reason)
+
+    websocket = FakeWebSocket()
+    asyncio.run(agent_websocket(websocket))
+
+    assert len(websocket.errors) == 3
+    assert websocket.closed == (1008, "too many failed hello attempts")
