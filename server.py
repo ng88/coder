@@ -738,12 +738,8 @@ app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_HTTP_REQUEST_BYTES)
 
 
 @app.get("/health", include_in_schema=False)
-async def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "connected_agents": len(state.agents),
-        "pending_requests": len(state.pending),
-    }
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.websocket("/ws/agent")
