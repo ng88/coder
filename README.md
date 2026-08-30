@@ -231,3 +231,7 @@ Direct TLS is supported with `--ssl-certfile` and `--ssl-keyfile`, although term
 The agent can execute commands and modify files inside the project from which it is launched. The temporary token grants access to that connected agent for as long as the session remains valid, so treat it as a secret.
 
 Prefer sandboxed execution where the platform supports it. Linux requires Bubblewrap and macOS uses `sandbox-exec`. Sandboxed commands do not get network access by default; use `--network` only when the work actually requires it. Windows command sandboxing is not implemented yet, so Windows currently runs commands with `--no-sandbox`; in that mode `--network` is unnecessary and has no effect.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
