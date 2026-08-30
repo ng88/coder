@@ -89,10 +89,13 @@ MAX_HTTP_REQUEST_BYTES = int(os.environ.get("REMOTE_AGENT_MAX_HTTP_REQUEST_BYTES
 MAX_HTTP_REQUESTS_PER_IP = int(os.environ.get("REMOTE_AGENT_HTTP_REQUESTS_PER_MINUTE", "600"))
 MAX_HTTP_REQUESTS_PER_MACHINE = int(os.environ.get("REMOTE_AGENT_HTTP_REQUESTS_PER_MACHINE_PER_MINUTE", "300"))
 HTTP_RATE_LIMIT_WINDOW = 60.0
+MAX_PENDING_REQUESTS_GLOBAL = int(os.environ.get("REMOTE_AGENT_PENDING_REQUESTS_GLOBAL", "500"))
+MAX_PENDING_REQUESTS_PER_AGENT = int(os.environ.get("REMOTE_AGENT_PENDING_REQUESTS_PER_AGENT", "10"))
+MAX_BRIDGE_PENDING_SECONDS = float(os.environ.get("REMOTE_AGENT_MAX_BRIDGE_PENDING_SECONDS", "1800"))
 
 # HTTP -> WS bridge timeout for non-command operations. Commands use their own
-# requested timeout plus a grace period. timeout=0 intentionally waits without
-# a server-side execution deadline (upstream HTTP infrastructure may still time out).
+# requested timeout plus a grace period. timeout=0 removes the command-level
+# timeout, but the bridge is still bounded by MAX_BRIDGE_PENDING_SECONDS.
 DEFAULT_TOOL_BRIDGE_TIMEOUT = 60.0
 COMMAND_TIMEOUT_GRACE = 15.0
 
@@ -689,6 +692,19 @@ class ServerState:
                 "The agent associated with this token is not connected.",
             )
 
+        if len(self.pending) >= MAX_PENDING_REQUESTS_GLOBAL:
+            return 503, error_payload(
+                "server_busy",
+                "The server has reached its pending request limit.",
+            )
+
+        machine_pending = sum(1 for pending in self.pending.values() if pending.machine_id == machine_id)
+        if machine_pending >= MAX_PENDING_REQUESTS_PER_AGENT:
+            return 503, error_payload(
+                "agent_busy",
+                "The agent has reached its pending request limit.",
+            )
+
         request_id = str(uuid.uuid4())
         ws_message = {"type": operation, "request_id": request_id, **payload}
         loop = asyncio.get_running_loop()
@@ -711,10 +727,10 @@ class ServerState:
             return 503, response
 
         try:
-            if bridge_timeout is None:
-                agent_message = await future
-            else:
-                agent_message = await asyncio.wait_for(future, timeout=bridge_timeout)
+            effective_timeout = MAX_BRIDGE_PENDING_SECONDS
+            if bridge_timeout is not None:
+                effective_timeout = min(bridge_timeout, MAX_BRIDGE_PENDING_SECONDS)
+            agent_message = await asyncio.wait_for(future, timeout=effective_timeout)
         except AgentDisconnected:
             response = error_payload("machine_not_connected", "Agent disconnected before responding.")
             return 503, response

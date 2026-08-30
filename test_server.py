@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 import server
-from server import HttpRateLimitMiddleware, MAX_WRITE_CONTENT_CHARS, RequestBodyLimitMiddleware, ServerState, WriteFileRequest, agent_websocket
+from server import HttpRateLimitMiddleware, MAX_WRITE_CONTENT_CHARS, PendingRequest, RequestBodyLimitMiddleware, ServerState, WriteFileRequest, agent_websocket
 
 
 def run_asgi(middleware, scope, incoming):
@@ -161,3 +161,81 @@ def test_websocket_registration_closes_after_three_failed_hellos(monkeypatch):
 
     assert len(websocket.errors) == 3
     assert websocket.closed == (1008, "too many failed hello attempts")
+
+
+def test_pending_request_global_limit(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PENDING_REQUESTS_GLOBAL", 1)
+    state = ServerState()
+
+    class FakeConnection:
+        async def send_json(self, payload):
+            raise AssertionError("request should be rejected before sending")
+
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        state.agents["machineid"] = FakeConnection()
+        state.pending["existing"] = PendingRequest(
+            request_id="existing",
+            machine_id="othermachine",
+            operation="readFile",
+            future=loop.create_future(),
+        )
+        return await state.route_operation(
+            "readFile",
+            {"token": "machineid:0123456789abcdef", "path": "file.txt"},
+            bridge_timeout=10,
+        )
+
+    status, body = asyncio.run(run_test())
+    assert status == 503
+    assert body["error"]["code"] == "server_busy"
+
+
+def test_pending_request_per_agent_limit(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PENDING_REQUESTS_PER_AGENT", 1)
+    state = ServerState()
+
+    class FakeConnection:
+        async def send_json(self, payload):
+            raise AssertionError("request should be rejected before sending")
+
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        state.agents["machineid"] = FakeConnection()
+        state.pending["existing"] = PendingRequest(
+            request_id="existing",
+            machine_id="machineid",
+            operation="readFile",
+            future=loop.create_future(),
+        )
+        return await state.route_operation(
+            "readFile",
+            {"token": "machineid:0123456789abcdef", "path": "file.txt"},
+            bridge_timeout=10,
+        )
+
+    status, body = asyncio.run(run_test())
+    assert status == 503
+    assert body["error"]["code"] == "agent_busy"
+
+
+def test_bridge_has_hard_pending_lifetime(monkeypatch):
+    monkeypatch.setattr(server, "MAX_BRIDGE_PENDING_SECONDS", 0.01)
+    state = ServerState()
+
+    class FakeConnection:
+        async def send_json(self, payload):
+            pass
+
+    async def run_test():
+        state.agents["machineid"] = FakeConnection()
+        return await state.route_operation(
+            "executeCommand",
+            {"token": "machineid:0123456789abcdef", "command": "sleep forever"},
+            bridge_timeout=None,
+        )
+
+    status, body = asyncio.run(run_test())
+    assert status == 504
+    assert body["error"]["code"] == "bridge_timeout"
+    assert state.pending == {}
