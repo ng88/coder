@@ -1,6 +1,6 @@
 # Coder Remote Agent
 
-`coder` connects a local project to a Coder GPT through a small public bridge server. The agent runs on your machine, while the GPT calls tools and routes requests to the connected agent using the temporary token printed at startup.
+`coder` connects a local project to a ChatGPT custom GPT through a small bridge server. The agent runs on your machine, while the GPT calls tools and routes requests to the connected agent using the temporary token printed at startup.
 
 ## Quick test
 
@@ -97,39 +97,10 @@ The server requires Python 3, FastAPI, and Uvicorn:
 python3 -m pip install fastapi uvicorn
 ```
 
-For development or a private network, start it directly:
+To start it run:
 
 ```sh
-python3 server.py --host 0.0.0.0 --port 8000
-```
-
-For production, it is better to bind locally and put the service behind an HTTPS reverse proxy such as Caddy or nginx:
-
-```sh
-python3 server.py --host 127.0.0.1 --port 8000
-```
-
-The public reverse proxy must support WebSocket upgrades and expose the same application over HTTPS/WSS.
-
-Important endpoints are:
-
-```text
-GET  /health
-GET  /openapi.json
-WS   /ws/agent
-POST /api/exec
-POST /api/start-command
-POST /api/poll-command
-POST /api/cancel-command
-POST /api/list-commands
-POST /api/read-file
-POST /api/write-file
-POST /api/delete-file
-POST /api/move-file
-POST /api/stat-file
-POST /api/search-files
-POST /api/apply-patch
-POST /api/list-files
+python3 server.py
 ```
 
 If your public server is available at:
@@ -156,28 +127,8 @@ There are three ways to select another server.
 
 #### Command-line parameter
 
-Linux/macOS:
-
 ```sh
 coder --server wss://coder.example.com/ws/agent
-```
-
-or directly from source:
-
-```sh
-python3 agent.py --server wss://coder.example.com/ws/agent
-```
-
-Windows:
-
-```powershell
-coder --server wss://coder.example.com/ws/agent
-```
-
-If commands executed by the agent need network access while remaining sandboxed, add `--network`:
-
-```sh
-coder --server wss://coder.example.com/ws/agent --network
 ```
 
 #### Environment variable
@@ -228,10 +179,6 @@ Create a GPT in ChatGPT, copy the contents of [`instructions.md`](instructions.m
 ```text
 https://coder.example.com/openapi.json
 ```
-
-The API does not use a fixed API key. Instead, each tool request contains the temporary token printed by the local agent. The token already contains both the machine identifier and the authentication secret, so the GPT should ask the user for the complete token and pass it unchanged to tool calls. `instructions.md` contains the recommended token-handling and coding-agent behavior for the GPT.
-
-The server's OpenAPI schema already describes the available tools and their parameters, so importing `/openapi.json` into the GPT Action configuration should expose synchronous and long-running command execution, file read/write/delete/move/stat operations, search, patching, and directory listing.
 
 ### Server configuration
 
