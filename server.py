@@ -65,6 +65,7 @@ except ImportError as exc:  # pragma: no cover - startup dependency check
 
 DEFAULT_HOST = os.environ.get("REMOTE_AGENT_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("REMOTE_AGENT_PORT", "8000"))
+DEFAULT_API_URL = os.environ.get("REMOTE_AGENT_API_URL", "https://coder.nghs.fr")
 
 # Agent currently uses websockets max_size=2 MiB. Keep the server at the same
 # order of magnitude so a request that fits one side also fits the other.
@@ -597,7 +598,7 @@ app = FastAPI(
     title="Remote Coding Agent API",
     version="1.0.0",
     servers=[
-        {"url": "https://coder.nghs.fr"},
+        {"url": DEFAULT_API_URL},
     ],
     description=(
         "Routes Custom GPT coding tools to a connected local agent. "

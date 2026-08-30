@@ -103,6 +103,25 @@ To start it run:
 python3 server.py
 ```
 
+Set `REMOTE_AGENT_API_URL` to the public HTTPS base URL of your server. This is
+the URL advertised in the generated OpenAPI schema (`/openapi.json`).
+
+Linux/macOS:
+
+```sh
+export REMOTE_AGENT_API_URL=https://coder.example.com
+python3 server.py
+```
+
+Windows PowerShell:
+
+```powershell
+$env:REMOTE_AGENT_API_URL = 'https://coder.example.com'
+python server.py
+```
+
+If `REMOTE_AGENT_API_URL` is not set, it defaults to `https://coder.nghs.fr`.
+
 If your public server is available at:
 
 ```text
@@ -134,6 +153,13 @@ coder --server wss://coder.example.com/ws/agent
 #### Environment variable
 
 The agent reads `REMOTE_AGENT_SERVER` when `--server` is not supplied.
+
+For a self-hosted setup, configure both sides consistently:
+
+```sh
+export REMOTE_AGENT_API_URL=https://coder.example.com
+export REMOTE_AGENT_SERVER=wss://coder.example.com/ws/agent
+```
 
 Linux/macOS:
 
