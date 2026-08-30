@@ -3,7 +3,8 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from server import HttpRateLimitMiddleware, MAX_WRITE_CONTENT_CHARS, RequestBodyLimitMiddleware, WriteFileRequest
+import server
+from server import HttpRateLimitMiddleware, MAX_WRITE_CONTENT_CHARS, RequestBodyLimitMiddleware, ServerState, WriteFileRequest
 
 
 def run_asgi(middleware, scope, incoming):
@@ -117,3 +118,15 @@ def test_http_rate_limit_rejects_excess_api_requests_per_ip():
     limited = run_asgi(middleware, scope, incoming)
     assert limited[0]["status"] == 429
     assert (b"retry-after", b"60") in limited[0]["headers"]
+
+
+def test_websocket_global_connection_limit(monkeypatch):
+    monkeypatch.setattr(server, "MAX_WS_CONNECTIONS_GLOBAL", 2)
+    state = ServerState()
+
+    assert state.acquire_ws_slot("203.0.113.1") is None
+    assert state.acquire_ws_slot("203.0.113.2") is None
+    assert state.acquire_ws_slot("203.0.113.3") == "global_connection_limit"
+
+    state.release_ws_slot("203.0.113.1")
+    assert state.acquire_ws_slot("203.0.113.3") is None

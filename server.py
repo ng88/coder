@@ -76,6 +76,7 @@ MAX_WS_MESSAGE_BYTES = 2 * 1024 * 1024
 # WebSocket abuse controls. These intentionally leave plenty of room for normal
 # reconnect behavior while bounding the resources a single source IP can hold.
 MAX_WS_CONNECTIONS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_CONNECTIONS_PER_IP", "20"))
+MAX_WS_CONNECTIONS_GLOBAL = int(os.environ.get("REMOTE_AGENT_WS_CONNECTIONS_GLOBAL", "2000"))
 MAX_WS_CONNECTION_ATTEMPTS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_ATTEMPTS_PER_MINUTE", "120"))
 WS_CONNECTION_ATTEMPT_WINDOW = 60.0
 
@@ -547,6 +548,7 @@ class ServerState:
         self.agents: dict[str, AgentConnection] = {}
         self.pending: dict[str, PendingRequest] = {}
         self.ws_connections_by_ip: dict[str, int] = defaultdict(int)
+        self.ws_connections_total = 0
         self.ws_connection_attempts_by_ip: dict[str, deque[float]] = defaultdict(deque)
         self.http_requests_by_machine: dict[str, deque[float]] = defaultdict(deque)
 
@@ -575,8 +577,11 @@ class ServerState:
 
         if self.ws_connections_by_ip[client_ip] >= MAX_WS_CONNECTIONS_PER_IP:
             return "connection_limit"
+        if self.ws_connections_total >= MAX_WS_CONNECTIONS_GLOBAL:
+            return "global_connection_limit"
 
         self.ws_connections_by_ip[client_ip] += 1
+        self.ws_connections_total += 1
         return None
 
     def release_ws_slot(self, client_ip: str) -> None:
@@ -585,6 +590,8 @@ class ServerState:
             self.ws_connections_by_ip.pop(client_ip, None)
         else:
             self.ws_connections_by_ip[client_ip] = current - 1
+        if current > 0:
+            self.ws_connections_total = max(0, self.ws_connections_total - 1)
 
         attempts = self.ws_connection_attempts_by_ip.get(client_ip)
         if attempts:
@@ -830,6 +837,9 @@ async def agent_websocket(websocket: WebSocket) -> None:
         if rejection == "rate_limit":
             logger.warning("WebSocket connection rate limit exceeded for %s", client_ip)
             await websocket.close(code=1013, reason="connection rate limit exceeded")
+        elif rejection == "global_connection_limit":
+            logger.warning("Global WebSocket connection limit exceeded")
+            await websocket.close(code=1013, reason="server connection limit exceeded")
         else:
             logger.warning("WebSocket concurrent connection limit exceeded for %s", client_ip)
             await websocket.close(code=1008, reason="too many concurrent connections")
