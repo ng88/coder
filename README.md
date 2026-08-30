@@ -118,7 +118,15 @@ GET  /health
 GET  /openapi.json
 WS   /ws/agent
 POST /api/exec
+POST /api/start-command
+POST /api/poll-command
+POST /api/cancel-command
+POST /api/list-commands
 POST /api/read-file
+POST /api/write-file
+POST /api/delete-file
+POST /api/move-file
+POST /api/stat-file
 POST /api/search-files
 POST /api/apply-patch
 POST /api/list-files
@@ -223,7 +231,7 @@ https://coder.example.com/openapi.json
 
 The API does not use a fixed API key. Instead, each tool request contains the temporary token printed by the local agent. The token already contains both the machine identifier and the authentication secret, so the GPT should ask the user for the complete token and pass it unchanged to tool calls. `instructions.md` contains the recommended token-handling and coding-agent behavior for the GPT.
 
-The server's OpenAPI schema already describes the available tools and their parameters, so importing `/openapi.json` into the GPT Action configuration should expose the command, file, search, patch, and directory-listing operations.
+The server's OpenAPI schema already describes the available tools and their parameters, so importing `/openapi.json` into the GPT Action configuration should expose synchronous and long-running command execution, file read/write/delete/move/stat operations, search, patching, and directory listing.
 
 ### Server configuration
 

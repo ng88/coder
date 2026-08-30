@@ -39,10 +39,13 @@ cat >"$payload" <<'__CODER_AGENT_PY_EOF_7C9B5F2A__'
 
 The agent is started from the project directory it should expose. It connects
 outbound to a WebSocket server, prints a temporary token of the form
-"machineid:authid", and handles five operations:
+"machineid:authid", and handles structured command and filesystem operations,
+including:
 
 - execute_command
+- start_command / poll_command / cancel_command / list_commands
 - read_file
+- write_file / delete_file / move_file / stat_file
 - search_files
 - apply_patch
 - list_files
@@ -295,6 +298,41 @@ class Workspace:
         if want_dir is True and not candidate.is_dir():
             raise AgentError("invalid_path", "Expected a directory.")
         if want_dir is False and not candidate.is_file():
+            raise AgentError("invalid_path", "Expected a file.")
+        return candidate
+
+    def resolve_existing_entry(self, user_path: str, *, want_dir: bool | None = None) -> Path:
+        """Resolve an existing directory entry without dereferencing its final symlink.
+
+        Parent components are still resolved strictly, so a symlinked parent cannot
+        escape the workspace. This is intended for operations such as delete and move
+        where the directory entry itself, rather than the symlink target, is mutated.
+        """
+        p = Path(user_path)
+        if p.is_absolute():
+            raise AgentError("invalid_path", "Absolute host paths are not allowed.")
+        if not p.parts:
+            raise AgentError("invalid_path", "Path must identify a workspace entry.")
+        if any(part == ".." for part in p.parts):
+            raise AgentError("path_outside_workspace", "Parent-directory traversal is not allowed.")
+
+        parent = self.root.joinpath(*p.parts[:-1]) if len(p.parts) > 1 else self.root
+        try:
+            parent = parent.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise AgentError("file_not_found", f"Path does not exist: {user_path}") from exc
+        except OSError as exc:
+            raise AgentError("invalid_path", f"Unable to resolve path: {user_path}") from exc
+        if not is_relative_to(parent, self.root):
+            raise AgentError("path_outside_workspace", "Path resolves outside the project workspace.")
+
+        candidate = parent / p.parts[-1]
+        if not candidate.exists() and not candidate.is_symlink():
+            raise AgentError("file_not_found", f"Path does not exist: {user_path}")
+
+        if want_dir is True and not candidate.is_dir():
+            raise AgentError("invalid_path", "Expected a directory.")
+        if want_dir is False and not (candidate.is_file() or candidate.is_symlink()):
             raise AgentError("invalid_path", "Expected a file.")
         return candidate
 
@@ -968,10 +1006,10 @@ class AgentTools:
         path_value = payload.get("path")
         if not isinstance(path_value, str) or not path_value:
             raise AgentError("invalid_request", "path must be a non-empty string.")
-        target = self.workspace.resolve_existing(path_value, want_dir=False)
+        target = self.workspace.resolve_existing_entry(path_value, want_dir=False)
         display = safe_relative_display(target, self.workspace.root)
         target.unlink()
-        if target.exists():
+        if target.exists() or target.is_symlink():
             raise AgentError("delete_verification_failed", "Deleted file is still present in the workspace.")
         return {"path": display, "deleted": True}
 
@@ -986,7 +1024,7 @@ class AgentTools:
             raise AgentError("invalid_request", "destination must be a non-empty string.")
         if not isinstance(overwrite, bool) or not isinstance(create_parents, bool):
             raise AgentError("invalid_request", "overwrite and create_parents must be booleans.")
-        source = self.workspace.resolve_existing(source_value, want_dir=False)
+        source = self.workspace.resolve_existing_entry(source_value, want_dir=False)
         destination = self.workspace.resolve_for_write(destination_value)
         if source == destination:
             raise AgentError("invalid_request", "source and destination must be different.")
@@ -999,11 +1037,22 @@ class AgentTools:
                 raise AgentError("invalid_path", "Destination parent directory does not exist.")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination = self.workspace.resolve_for_write(destination_value)
-        before = source.read_bytes()
+        before_size, before_hash, before_link = self._entry_fingerprint(source)
         os.replace(source, destination)
-        if source.exists() or not destination.is_file() or destination.read_bytes() != before:
+        if source.exists() or source.is_symlink():
             raise AgentError("move_verification_failed", "Moved file could not be verified.")
-        return {"source": source_value, "destination": safe_relative_display(destination, self.workspace.root), "bytes": len(before), "sha256": hashlib.sha256(before).hexdigest()}
+        try:
+            after_size, after_hash, after_link = self._entry_fingerprint(destination)
+        except AgentError as exc:
+            raise AgentError("move_verification_failed", "Moved file could not be verified.") from exc
+        if (after_size, after_hash, after_link) != (before_size, before_hash, before_link):
+            raise AgentError("move_verification_failed", "Moved file could not be verified.")
+        return {
+            "source": source_value,
+            "destination": safe_relative_display(destination, self.workspace.root),
+            "bytes": before_size,
+            "sha256": before_hash,
+        }
 
     async def stat_file(self, payload: dict[str, Any]) -> dict[str, Any]:
         path_value = payload.get("path")
@@ -1112,7 +1161,8 @@ class AgentTools:
             dirs[:] = sorted(d for d in dirs if d not in {".git"})
             for name in dirs:
                 p = root_path / name
-                entries.append({"path": safe_relative_display(p, self.workspace.root), "type": "directory"})
+                kind = "symlink" if p.is_symlink() else "directory"
+                entries.append({"path": safe_relative_display(p, self.workspace.root), "type": kind})
                 if len(entries) >= max_entries:
                     truncated = True
                     break
@@ -1130,6 +1180,23 @@ class AgentTools:
                 break
 
         return {"entries": entries, "truncated": truncated}
+
+    @staticmethod
+    def _entry_fingerprint(path: Path) -> tuple[int, str, str | None]:
+        """Return a bounded-memory fingerprint for a regular file or symlink."""
+        if path.is_symlink():
+            link_target = os.readlink(path)
+            data = os.fsencode(link_target)
+            return len(data), hashlib.sha256(data).hexdigest(), link_target
+        if not path.is_file():
+            raise AgentError("invalid_path", "Expected a regular file or symlink.")
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+        return size, digest.hexdigest(), None
 
     def _iter_files(self, base: Path) -> Iterable[Path]:
         for root, dirs, files in os.walk(base, followlinks=False):

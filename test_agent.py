@@ -47,6 +47,60 @@ class AgentToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(deleted["deleted"])
         self.assertFalse((self.root / "other/b.txt").exists())
 
+    async def test_delete_file_removes_symlink_not_target(self):
+        target = self.root / "target.txt"
+        target.write_text("keep me")
+        link = self.root / "link.txt"
+        link.symlink_to(target.name)
+
+        result = await self.tools.delete_file({"path": "link.txt"})
+
+        self.assertTrue(result["deleted"])
+        self.assertFalse(link.exists())
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(target.read_text(), "keep me")
+
+    async def test_move_file_moves_symlink_not_target(self):
+        target = self.root / "target.txt"
+        target.write_text("keep me")
+        source = self.root / "link.txt"
+        source.symlink_to(target.name)
+
+        result = await self.tools.move_file({"source": "link.txt", "destination": "moved-link.txt"})
+
+        destination = self.root / "moved-link.txt"
+        self.assertFalse(source.exists())
+        self.assertFalse(source.is_symlink())
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(destination.readlink(), Path(target.name))
+        self.assertEqual(target.read_text(), "keep me")
+        expected = target.name.encode()
+        self.assertEqual(result["bytes"], len(expected))
+        self.assertEqual(result["sha256"], hashlib.sha256(expected).hexdigest())
+
+    async def test_move_file_streams_verification_for_large_regular_file(self):
+        source = self.root / "large.bin"
+        payload = b"x" * (agent_module.MAX_FILE_BYTES + 1)
+        source.write_bytes(payload)
+
+        result = await self.tools.move_file({"source": "large.bin", "destination": "moved.bin"})
+
+        self.assertEqual(result["bytes"], len(payload))
+        self.assertEqual(result["sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual((self.root / "moved.bin").stat().st_size, len(payload))
+
+    async def test_list_files_reports_directory_symlink_as_symlink(self):
+        real_dir = self.root / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "file.txt").write_text("hello")
+        (self.root / "dir-link").symlink_to(real_dir.name, target_is_directory=True)
+
+        result = await self.tools.list_files({"path": ".", "depth": 2})
+        by_path = {entry["path"]: entry["type"] for entry in result["entries"]}
+
+        self.assertEqual(by_path["dir-link"], "symlink")
+        self.assertEqual(by_path["real-dir"], "directory")
+
     async def test_write_refuses_overwrite_by_default(self):
         (self.root / "a.txt").write_text("old")
         with self.assertRaises(AgentError) as raised:
