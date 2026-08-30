@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import defaultdict, deque
+import ipaddress
 import json
 import logging
 import os
@@ -70,6 +72,12 @@ DEFAULT_API_URL = os.environ.get("REMOTE_AGENT_API_URL", "https://coder.nghs.fr"
 # Agent currently uses websockets max_size=2 MiB. Keep the server at the same
 # order of magnitude so a request that fits one side also fits the other.
 MAX_WS_MESSAGE_BYTES = 2 * 1024 * 1024
+
+# WebSocket abuse controls. These intentionally leave plenty of room for normal
+# reconnect behavior while bounding the resources a single source IP can hold.
+MAX_WS_CONNECTIONS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_CONNECTIONS_PER_IP", "20"))
+MAX_WS_CONNECTION_ATTEMPTS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_ATTEMPTS_PER_MINUTE", "120"))
+WS_CONNECTION_ATTEMPT_WINDOW = 60.0
 
 # HTTP -> WS bridge timeout for non-command operations. Commands use their own
 # requested timeout plus a grace period. timeout=0 intentionally waits without
@@ -444,6 +452,41 @@ class ServerState:
     def __init__(self) -> None:
         self.agents: dict[str, AgentConnection] = {}
         self.pending: dict[str, PendingRequest] = {}
+        self.ws_connections_by_ip: dict[str, int] = defaultdict(int)
+        self.ws_connection_attempts_by_ip: dict[str, deque[float]] = defaultdict(deque)
+
+    def acquire_ws_slot(self, client_ip: str) -> str | None:
+        """Reserve a WebSocket slot, returning a rejection reason when limited."""
+        now = time.monotonic()
+        attempts = self.ws_connection_attempts_by_ip[client_ip]
+        cutoff = now - WS_CONNECTION_ATTEMPT_WINDOW
+        while attempts and attempts[0] <= cutoff:
+            attempts.popleft()
+
+        if len(attempts) >= MAX_WS_CONNECTION_ATTEMPTS_PER_IP:
+            return "rate_limit"
+        attempts.append(now)
+
+        if self.ws_connections_by_ip[client_ip] >= MAX_WS_CONNECTIONS_PER_IP:
+            return "connection_limit"
+
+        self.ws_connections_by_ip[client_ip] += 1
+        return None
+
+    def release_ws_slot(self, client_ip: str) -> None:
+        current = self.ws_connections_by_ip.get(client_ip, 0)
+        if current <= 1:
+            self.ws_connections_by_ip.pop(client_ip, None)
+        else:
+            self.ws_connections_by_ip[client_ip] = current - 1
+
+        attempts = self.ws_connection_attempts_by_ip.get(client_ip)
+        if attempts:
+            cutoff = time.monotonic() - WS_CONNECTION_ATTEMPT_WINDOW
+            while attempts and attempts[0] <= cutoff:
+                attempts.popleft()
+            if not attempts:
+                self.ws_connection_attempts_by_ip.pop(client_ip, None)
 
     async def register(self, machine_id: str, websocket: WebSocket) -> AgentConnection | None:
         if not MACHINE_ID_RE.fullmatch(machine_id):
@@ -594,6 +637,25 @@ state = ServerState()
 # ---------------------------------------------------------------------------
 
 
+def websocket_client_ip(websocket: WebSocket) -> str:
+    """Return the source IP, trusting X-Forwarded-For only from loopback proxies."""
+    peer_ip = websocket.client.host if websocket.client is not None else "unknown"
+    try:
+        peer_is_loopback = ipaddress.ip_address(peer_ip).is_loopback
+    except ValueError:
+        peer_is_loopback = False
+
+    if peer_is_loopback:
+        forwarded_for = websocket.headers.get("x-forwarded-for")
+        if forwarded_for:
+            candidate = forwarded_for.split(",", 1)[0].strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                logger.warning("Ignoring invalid X-Forwarded-For address: %r", candidate)
+    return peer_ip
+
+
 app = FastAPI(
     title="Remote Coding Agent API",
     version="1.0.0",
@@ -620,7 +682,18 @@ async def health() -> dict[str, Any]:
 
 @app.websocket("/ws/agent")
 async def agent_websocket(websocket: WebSocket) -> None:
+    client_ip = websocket_client_ip(websocket)
+    rejection = state.acquire_ws_slot(client_ip)
     await websocket.accept()
+    if rejection is not None:
+        if rejection == "rate_limit":
+            logger.warning("WebSocket connection rate limit exceeded for %s", client_ip)
+            await websocket.close(code=1013, reason="connection rate limit exceeded")
+        else:
+            logger.warning("WebSocket concurrent connection limit exceeded for %s", client_ip)
+            await websocket.close(code=1008, reason="too many concurrent connections")
+        return
+
     conn: AgentConnection | None = None
     close_reason = "disconnected"
 
@@ -672,6 +745,7 @@ async def agent_websocket(websocket: WebSocket) -> None:
     finally:
         if conn is not None:
             await state.unregister(conn, reason=close_reason)
+        state.release_ws_slot(client_ip)
 
 
 def _public_payload(model: BaseModel) -> dict[str, Any]:
