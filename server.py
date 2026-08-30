@@ -83,6 +83,9 @@ WS_CONNECTION_ATTEMPT_WINDOW = 60.0
 # ample headroom for the 500k-character tool fields, including JSON escaping
 # and multi-byte UTF-8 content, while preventing unbounded request buffering.
 MAX_HTTP_REQUEST_BYTES = int(os.environ.get("REMOTE_AGENT_MAX_HTTP_REQUEST_BYTES", str(4 * 1024 * 1024)))
+MAX_HTTP_REQUESTS_PER_IP = int(os.environ.get("REMOTE_AGENT_HTTP_REQUESTS_PER_MINUTE", "600"))
+MAX_HTTP_REQUESTS_PER_MACHINE = int(os.environ.get("REMOTE_AGENT_HTTP_REQUESTS_PER_MACHINE_PER_MINUTE", "300"))
+HTTP_RATE_LIMIT_WINDOW = 60.0
 
 # HTTP -> WS bridge timeout for non-command operations. Commands use their own
 # requested timeout plus a grace period. timeout=0 intentionally waits without
@@ -160,6 +163,32 @@ class RequestBodyLimitMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+class HttpRateLimitMiddleware:
+    """Apply a generous per-IP rate limit to public API requests."""
+
+    def __init__(self, app: Any, max_requests: int) -> None:
+        self.app = app
+        self.max_requests = max_requests
+        self.requests_by_ip: dict[str, deque[float]] = defaultdict(deque)
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+
+        client_ip = http_client_ip(scope)
+        now = time.monotonic()
+        requests = self.requests_by_ip[client_ip]
+        cutoff = now - HTTP_RATE_LIMIT_WINDOW
+        while requests and requests[0] <= cutoff:
+            requests.popleft()
+        if len(requests) >= self.max_requests:
+            await send_rate_limited(send)
+            return
+        requests.append(now)
+        await self.app(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +548,18 @@ class ServerState:
         self.pending: dict[str, PendingRequest] = {}
         self.ws_connections_by_ip: dict[str, int] = defaultdict(int)
         self.ws_connection_attempts_by_ip: dict[str, deque[float]] = defaultdict(deque)
+        self.http_requests_by_machine: dict[str, deque[float]] = defaultdict(deque)
+
+    def allow_http_machine_request(self, machine_id: str) -> bool:
+        now = time.monotonic()
+        requests = self.http_requests_by_machine[machine_id]
+        cutoff = now - HTTP_RATE_LIMIT_WINDOW
+        while requests and requests[0] <= cutoff:
+            requests.popleft()
+        if len(requests) >= MAX_HTTP_REQUESTS_PER_MACHINE:
+            return False
+        requests.append(now)
+        return True
 
     def acquire_ws_slot(self, client_ip: str) -> str | None:
         """Reserve a WebSocket slot, returning a rejection reason when limited."""
@@ -721,6 +762,43 @@ def websocket_client_ip(websocket: WebSocket) -> str:
     return peer_ip
 
 
+def http_client_ip(scope: dict[str, Any]) -> str:
+    """Return source IP, trusting X-Forwarded-For only from a loopback proxy."""
+    client = scope.get("client")
+    peer_ip = str(client[0]) if client else "unknown"
+    try:
+        peer_is_loopback = ipaddress.ip_address(peer_ip).is_loopback
+    except ValueError:
+        peer_is_loopback = False
+
+    if peer_is_loopback:
+        headers = dict(scope.get("headers", []))
+        forwarded_for = headers.get(b"x-forwarded-for")
+        if forwarded_for:
+            candidate = forwarded_for.decode("latin1").split(",", 1)[0].strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                logger.warning("Ignoring invalid X-Forwarded-For address: %r", candidate)
+    return peer_ip
+
+
+async def send_rate_limited(send: Any) -> None:
+    body = b'{"detail":"Too many requests"}'
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 429,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"retry-after", b"60"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
 app = FastAPI(
     title="Remote Coding Agent API",
     version="1.0.0",
@@ -735,6 +813,7 @@ app = FastAPI(
     ),
 )
 app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_HTTP_REQUEST_BYTES)
+app.add_middleware(HttpRateLimitMiddleware, max_requests=MAX_HTTP_REQUESTS_PER_IP)
 
 
 @app.get("/health", include_in_schema=False)
@@ -817,6 +896,14 @@ def _public_payload(model: BaseModel) -> dict[str, Any]:
 
 
 async def _run_tool(operation: str, model: BaseModel, *, timeout: float | None) -> JSONResponse | dict[str, Any]:
+    token = getattr(model, "token", None)
+    if isinstance(token, str):
+        try:
+            machine_id, _ = parse_token(token)
+        except ValueError:
+            machine_id = None
+        if machine_id is not None and not state.allow_http_machine_request(machine_id):
+            return JSONResponse(status_code=429, content={"detail": "Too many requests"}, headers={"Retry-After": "60"})
     status, body = await state.route_operation(operation, _public_payload(model), bridge_timeout=timeout)
     if status == 200:
         return body
