@@ -779,7 +779,7 @@ def websocket_client_ip(websocket: WebSocket) -> str:
     if peer_is_loopback:
         forwarded_for = websocket.headers.get("x-forwarded-for")
         if forwarded_for:
-            candidate = forwarded_for.split(",", 1)[0].strip()
+            candidate = forwarded_for.rsplit(",", 1)[-1].strip()
             try:
                 return str(ipaddress.ip_address(candidate))
             except ValueError:
@@ -800,7 +800,7 @@ def http_client_ip(scope: dict[str, Any]) -> str:
         headers = dict(scope.get("headers", []))
         forwarded_for = headers.get(b"x-forwarded-for")
         if forwarded_for:
-            candidate = forwarded_for.decode("latin1").split(",", 1)[0].strip()
+            candidate = forwarded_for.decode("latin1").rsplit(",", 1)[-1].strip()
             try:
                 return str(ipaddress.ip_address(candidate))
             except ValueError:
