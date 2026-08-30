@@ -79,6 +79,11 @@ MAX_WS_CONNECTIONS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_CONNECTIONS_PER_
 MAX_WS_CONNECTION_ATTEMPTS_PER_IP = int(os.environ.get("REMOTE_AGENT_WS_ATTEMPTS_PER_MINUTE", "120"))
 WS_CONNECTION_ATTEMPT_WINDOW = 60.0
 
+# Bound HTTP request bodies before FastAPI/Pydantic parses them. 4 MiB leaves
+# ample headroom for the 500k-character tool fields, including JSON escaping
+# and multi-byte UTF-8 content, while preventing unbounded request buffering.
+MAX_HTTP_REQUEST_BYTES = int(os.environ.get("REMOTE_AGENT_MAX_HTTP_REQUEST_BYTES", str(4 * 1024 * 1024)))
+
 # HTTP -> WS bridge timeout for non-command operations. Commands use their own
 # requested timeout plus a grace period. timeout=0 intentionally waits without
 # a server-side execution deadline (upstream HTTP infrastructure may still time out).
@@ -86,6 +91,7 @@ DEFAULT_TOOL_BRIDGE_TIMEOUT = 60.0
 COMMAND_TIMEOUT_GRACE = 15.0
 
 MAX_COMMAND_CHARS = 500_000
+MAX_WRITE_CONTENT_CHARS = 500_000
 MAX_PATCH_CHARS = 400_000
 MAX_PATH_CHARS = 4096
 MAX_QUERY_CHARS = 20_000
@@ -95,6 +101,65 @@ MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 AUTH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,512}$")
 
 logger = logging.getLogger("remote-agent-server")
+
+
+class RequestBodyLimitMiddleware:
+    """Reject oversized HTTP request bodies before application-level parsing."""
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > self.max_bytes:
+                    await self._send_too_large(send)
+                    return
+            except ValueError:
+                pass
+
+        messages: deque[dict[str, Any]] = deque()
+        total = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request":
+                break
+            total += len(message.get("body", b""))
+            if total > self.max_bytes:
+                await self._send_too_large(send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        async def replay_receive() -> dict[str, Any]:
+            if messages:
+                return messages.popleft()
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _send_too_large(send: Any) -> None:
+        body = b'{"detail":"Request body too large"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +257,7 @@ class ReadFileRequest(TokenRequest):
 
 class WriteFileRequest(TokenRequest):
     path: str = Field(..., min_length=1, max_length=MAX_PATH_CHARS)
-    content: str
+    content: str = Field(..., max_length=MAX_WRITE_CONTENT_CHARS)
     overwrite: bool = False
     create_parents: bool = False
 
@@ -669,6 +734,7 @@ app = FastAPI(
         "never request a separate machine name or ID."
     ),
 )
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_HTTP_REQUEST_BYTES)
 
 
 @app.get("/health", include_in_schema=False)
