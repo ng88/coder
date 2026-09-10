@@ -4,7 +4,9 @@
 
 ## Quick test
 
-The fastest way to try Coder is to use the default public server. You only need Python 3 and the `websockets` package.
+The fastest way to try Coder is to use the default public server.
+
+Open the [Coder GPT](https://chatgpt.com/g/g-ndh9xWN5A-coder) with your ChatGPT Plus or Pro account and install the agent.
 
 Install the Python dependency:
 
